@@ -1,0 +1,1 @@
+savedcmd_/home/faghy/puksar2/linux-driver/Module.symvers :=  scripts/mod/modpost -M -m       -o /home/faghy/puksar2/linux-driver/Module.symvers -n -T /home/faghy/puksar2/linux-driver/modules.order -i Module.symvers -e 
