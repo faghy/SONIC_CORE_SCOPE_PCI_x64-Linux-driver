@@ -94,6 +94,7 @@ static int __snd_pulsar_probe(struct pci_dev *pci, const struct pci_device_id *p
 	chip->irq = -1;
 	spin_lock_init(&chip->reg_lock);
 	mutex_init(&chip->route_mutex);
+	mutex_init(&chip->fifo_mutex);
 
 	err = pcim_enable_device(pci);
 	if (err < 0)

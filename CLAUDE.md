@@ -164,6 +164,12 @@ sudo rmmod snd-pulsar
    BAR+0x10 is a 1:1 frame counter (15 bit, wraps at 0x8000); IRQ 43/s at block 1024.
    NOTE: WirePlumber only picks up the PCM if it starts after SET_ROUTE (in tests: `systemctl --user restart
    wireplumber`); in the final package the loader runs at boot before the user session.
-5. **Next:** capture (P2_ANI -> comm slots, docs/pcm_streaming.md 5.6), ALSA mixer control for LINVOL, 48 kHz test,
+4b. **CAPTURE + DIRECT MONITOR + MIXER: WORKING (2026-10-07).** `--pcm --monitor -12`: P2_ANI@DSP1 sync outs ->
+   comm slots 0xC0A4/0xC0A6 -> capture slots 0x52/0x53 (entry |1); verified with arecord on hw:2,0 (24-bit samples, L != R).
+   Monitor per channel: PC->LINVOL and ANI->LINVOL -> ADD2N ((a+b)/2) -> P2_ANO. Mixer controls (PULSAR_IOCTL_SET_CONTROLS):
+   "DSP Out Playback Volume" and "Input Monitor Playback Volume" = LINVOL Vol slots, written by the kernel via the command
+   FIFO (pulsar_dsp.c); deliberately NOT named "PCM" so PipeWire keeps software volume and cannot lift the safety gain.
+   Test workflow: `systemctl --user stop wireplumber` before reload/boot (it holds the card), start it again afterwards.
+5. **Next:** 48 kHz test,
    packaging (DKMS + systemd unit running the loader at boot + script extracting DSP files from the user's installer),
    then the SCOPE-like config app.

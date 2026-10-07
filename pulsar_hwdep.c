@@ -5,6 +5,8 @@
  */
 
 #include <linux/mm.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <sound/core.h>
 #include <sound/hwdep.h>
@@ -24,12 +26,21 @@ static int pulsar_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 	struct pulsar_card *chip = hw->private_data;
 	struct pulsar_info info = {};
 	struct pulsar_pcm_route route;
+	struct pulsar_controls *ctls;
+	int err;
 
 	switch (cmd) {
 	case PULSAR_IOCTL_SET_ROUTE:
 		if (copy_from_user(&route, (void __user *)arg, sizeof(route)))
 			return -EFAULT;
 		return pulsar_pcm_set_route(chip, &route);
+	case PULSAR_IOCTL_SET_CONTROLS:
+		ctls = memdup_user((void __user *)arg, sizeof(*ctls));
+		if (IS_ERR(ctls))
+			return PTR_ERR(ctls);
+		err = pulsar_mixer_set_controls(chip, ctls);
+		kfree(ctls);
+		return err;
 	case PULSAR_IOCTL_GET_INFO:
 		info.board_raw_id = chip->board_raw_id;
 		info.board_rev = chip->board_rev;

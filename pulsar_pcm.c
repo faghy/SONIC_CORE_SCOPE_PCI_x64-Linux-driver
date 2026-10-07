@@ -317,21 +317,15 @@ int pulsar_pcm_set_route(struct pulsar_card *chip, const struct pulsar_pcm_route
 		err = -EBUSY;
 		goto out;
 	}
-	/* the PCM device's stream directions are fixed when it is first created */
-	if (chip->pcm && ((r->play_channels && !chip->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream_count) ||
-			  (r->cap_channels && !chip->pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream_count))) {
-		err = -EINVAL;
-		goto out;
-	}
-
 	spin_lock_irqsave(&chip->reg_lock, flags);
 	chip->route = *r;
 	table_layout(chip);
 	chip->route_valid = true;
 	spin_unlock_irqrestore(&chip->reg_lock, flags);
 
+	/* both directions always exist; open() fails with -ENODEV for a direction the route lacks */
 	if (!chip->pcm)
-		err = pulsar_pcm_create(chip, r->play_channels, r->cap_channels);
+		err = pulsar_pcm_create(chip, true, true);
 out:
 	mutex_unlock(&chip->route_mutex);
 	return err;

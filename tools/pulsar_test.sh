@@ -6,7 +6,10 @@ REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 
 if [ "${1:-}" = "reload" ]; then
 	echo "=== rmmod (reload)"
-	rmmod snd_pulsar 2>/dev/null && sleep 1
+	if lsmod | grep -q '^snd_pulsar'; then
+		rmmod snd_pulsar || { echo "ERROR: cannot unload snd_pulsar (stop wireplumber first)"; exit 1; }
+		sleep 1
+	fi
 	shift
 fi
 

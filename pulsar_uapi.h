@@ -38,8 +38,29 @@ struct pulsar_pcm_route {
 	__u32 flags;                              /* reserved, 0 */
 };
 
+/*
+ * Mixer controls backed by DSP values (e.g. the LINVOL "Vol" input of a module). Each channel is a
+ * 2-word sync value slot in DSP data memory; the kernel writes a 1.31 gain into both words.
+ * Range -60..0 dB in 0.5 dB steps, minimum = mute.
+ */
+#define PULSAR_MAX_CONTROLS    4
+
+struct pulsar_ctl_desc {
+	char name[44];                            /* ALSA control name, e.g. "PCM Playback Volume" */
+	__u32 dsp;
+	__u32 channels;                           /* 1 or 2 */
+	__u32 addr[2];                            /* DM address of each channel's value slot */
+	__s32 init_cdb;                           /* initial gain in 0.01 dB (-6000..0) */
+};
+
+struct pulsar_controls {
+	__u32 count;
+	struct pulsar_ctl_desc ctl[PULSAR_MAX_CONTROLS];
+};
+
 #define PULSAR_IOCTL_MAGIC     'P'
 #define PULSAR_IOCTL_GET_INFO  _IOR(PULSAR_IOCTL_MAGIC, 0x01, struct pulsar_info)
 #define PULSAR_IOCTL_SET_ROUTE _IOW(PULSAR_IOCTL_MAGIC, 0x02, struct pulsar_pcm_route)
+#define PULSAR_IOCTL_SET_CONTROLS _IOW(PULSAR_IOCTL_MAGIC, 0x03, struct pulsar_controls)
 
 #endif /* _PULSAR_UAPI_H_ */

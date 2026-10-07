@@ -13,7 +13,9 @@ Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `
 | 48 kHz, clock esterno | implementato, non ancora testato |
 | Caricamento moduli DSP (linker), uscite analogiche | **funziona**: tono di prova sulle uscite 1/2 |
 | Riproduzione audio dal PC (ALSA PCM, PipeWire) | **funziona**: uscita "Pulsar2 Stereo" |
-| Registrazione (ingressi analogici), JACK/Ardour, pacchetto installabile | da fare |
+| Registrazione dagli ingressi analogici 1/2 | **funziona**: ingresso "Pulsar2 Stereo" |
+| Monitor diretto ingressi → uscite, volumi in `alsamixer` | **funziona**: "DSP Out", "Input Monitor" |
+| Pacchetto installabile (avvio automatico), JACK/Ardour, 48 kHz | da fare |
 
 ## Architettura
 
@@ -45,7 +47,8 @@ make                                   # usa /lib/modules/$(uname -r)/build
 pkexec tools/pulsar_test.sh boot       # carica il modulo, avvia i DSP, imposta 44,1 kHz
 pkexec tools/pulsar_test.sh clock      # misura il word clock dei DSP
 pkexec tools/pulsar_test.sh boot --tone 440 --volume -40   # tono di prova sulle uscite analogiche 1/2
-pkexec tools/pulsar_test.sh reload boot --bus-master --irq --pcm   # scheda audio ALSA/PipeWire (uscite 1/2)
+pkexec tools/pulsar_test.sh reload boot --bus-master --irq --pcm --monitor -12   # scheda audio ALSA/PipeWire + monitor
+alsamixer -c 2                         # volumi "DSP Out" e "Input Monitor"
 tools/pulsar_loader.py boot --dry-run  # simulazione senza hardware
 ```
 Altri comandi di `pulsar_test.sh` (tutti richiedono root):

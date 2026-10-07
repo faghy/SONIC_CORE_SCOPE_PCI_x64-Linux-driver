@@ -794,27 +794,81 @@ def set_route(bar, rate, block, play_slots=(), cap_slots=()):
         fcntl.ioctl(bar.fd, req, buf)
 
 
-def setup_pcm(b, dsp_dir, rate, volume_db=-30.0, block=1024):
-    """Playback graph: PC slots 0x180/0x181 -> LINVOL L/R (safety gain) -> P2_ANO on DSP1, then SET_ROUTE."""
+def set_controls(bar, controls):
+    """PULSAR_IOCTL_SET_CONTROLS: controls = [(name, dsp, [addrL, addrR], init_db), ...]."""
+    import fcntl
+    buf = struct.pack("<I", len(controls))
+    for name, dsp, addrs, init_db in controls:
+        a = list(addrs) + [0] * (2 - len(addrs))
+        buf += struct.pack("<44sIIIIi", name.encode()[:43], dsp, len(addrs), a[0], a[1], int(round(init_db * 100)))
+    buf += bytes(4 + 4 * 64 - len(buf))                               # struct pulsar_controls: 4 x 64-byte entries
+    req = (1 << 30) | (len(buf) << 16) | (ord("P") << 8) | 0x03     # _IOW('P', 3, struct pulsar_controls)
+    if isinstance(bar, Bar):
+        fcntl.ioctl(bar.fd, req, buf)
+
+
+def _gain(db):
+    return min(0x7FFFFFFF, int(round(10 ** (db / 20.0) * 0x7FFFFFFF)))
+
+
+def setup_pcm(b, dsp_dir, rate, volume_db=-30.0, block=1024, monitor_db=None):
+    """Analog graph on DSP1, then SET_ROUTE (docs/pcm_streaming.md 5.6):
+         PC slot 0x180/0x181 -> LINVOL (volume_db) ---------------------> P2_ANO L/R
+         P2_ANI L/R -> capture slots (to the host)
+       with monitor_db (direct monitoring, no PC latency), per channel:
+         PC  -> LINVOL (volume_db + 6) ---\
+                                          ADD2N ((a+b)/2) -> P2_ANO
+         ANI -> LINVOL (monitor_db + 6) --/
+    """
     import pulsar_modules as pm
     rack = pm.Rack(dsp_dir)
-    _, ops = rack.load(os.path.join(dsp_dir, "P2_AINIT.dsp"), 0)
-    ano, o = rack.load(os.path.join(dsp_dir, "P2_ANO.dsp"), 1)
+    mod = lambda name, dsp=1: rack.load(os.path.join(dsp_dir, name), dsp)
+    _, ops = mod("P2_AINIT.dsp", 0)
+    ano, o = mod("P2_ANO.dsp")
     ops += o
-    gain = min(0x7FFFFFFF, int(round(10 ** (volume_db / 20.0) * 0x7FFFFFFF)))
-    for ch, slot in enumerate(PLAY_SLOTS):
-        vol, o = rack.load(os.path.join(dsp_dir, "LINVOL.dsp"), 1)
+    # capture: P2_ANI LOut/ROut -> own comm slots in DSP1's sync block, copied to the host by the card
+    ani, o = mod("P2_ANI.dsp")
+    ops += o
+    cap_slots = []
+    for j in range(2):
+        addr, o = rack.dsp[1].alloc_sync_output(ani, j)
         ops += o
-        ops += rack.dsp[1].link_input(vol, 0, 0xC000 + 2 * slot)       # signal <- PC slot
-        ops += rack.set_in_pad(vol, 1, gain)
-        ops += rack.connect(vol, 0, ano, ch)
+        cap_slots.append((addr - 0xC000) // 2)
+    mix_comp = 6.0 if monitor_db is not None else 0.0                  # ADD2N halves both inputs
+    pc_vols, mon_vols = [], []
+    for ch, slot in enumerate(PLAY_SLOTS):
+        pc, o = mod("LINVOL.dsp")
+        ops += o
+        ops += rack.dsp[1].link_input(pc, 0, 0xC000 + 2 * slot)        # signal <- PC slot
+        ops += rack.set_in_pad(pc, 1, _gain(volume_db + mix_comp))
+        pc_vols.append(pc)
+        if monitor_db is None:
+            ops += rack.connect(pc, 0, ano, ch)
+            continue
+        mon, o = mod("LINVOL.dsp")
+        ops += o
+        ops += rack.connect(ani, ch, mon, 0)                            # signal <- analog in
+        ops += rack.set_in_pad(mon, 1, _gain(monitor_db + mix_comp))
+        mon_vols.append(mon)
+        add, o = mod("ADD2N.dsp")
+        ops += o
+        ops += rack.connect(pc, 0, add, 0) + rack.connect(mon, 0, add, 1) + rack.connect(add, 0, ano, ch)
     if b.verbose:
         print(pm.format_ops(ops))
     pm.execute(b, ops)
     b.plate_set(RATE_BITS.get(rate, 0x4))                              # un-mute analog outs
-    set_route(b.bar, rate, block, PLAY_SLOTS)
-    print("  PCM route set: playback slots %s -> LINVOL %.1f dB -> analog out 1/2"
+    set_route(b.bar, rate, block, PLAY_SLOTS, cap_slots)
+    # mixer controls = LINVOL gains (alsamixer: "DSP Out", "Input Monitor"); not named "PCM" on purpose,
+    # so PipeWire keeps its software volume and does not lift the safety gain
+    ctls = [("DSP Out Playback Volume", 1, [m.value_slots[1] for m in pc_vols], volume_db + mix_comp)]
+    if mon_vols:
+        ctls.append(("Input Monitor Playback Volume", 1, [m.value_slots[1] for m in mon_vols], monitor_db + mix_comp))
+    set_controls(b.bar, ctls)
+    print("  playback: slots %s -> %.1f dB -> analog out 1/2"
           % (", ".join("0x%x" % s for s in PLAY_SLOTS), volume_db))
+    print("  capture: analog in 1/2 (P2_ANI@DSP1) -> slots %s" % ", ".join("0x%x" % s for s in cap_slots))
+    if monitor_db is not None:
+        print("  direct monitor: analog in 1/2 -> analog out 1/2 at %.1f dB" % monitor_db)
 
 
 def cmd_plate(args):
@@ -902,7 +956,7 @@ def cmd_boot(args):
             if not (args.irq and args.bus_master):
                 raise LoaderError("--pcm needs --irq and --bus-master")
             print("[pcm] playback graph + ALSA route")
-            setup_pcm(b, args.dsp_dir, args.rate, args.volume)
+            setup_pcm(b, args.dsp_dir, args.rate, args.volume, monitor_db=args.monitor)
         elif args.tone:
             print("[tone] sine %g Hz, %.1f dB -> P-Plate analog out 1/2" % (args.tone, args.volume))
             play_tone(b, args.dsp_dir, args.tone, args.rate, args.volume)
@@ -928,6 +982,7 @@ def main():
     ap.add_argument("--rate", type=int, default=44100, choices=(32000, 44100, 48000))
     ap.add_argument("--clock", default="internal", choices=("internal", "external"))
     ap.add_argument("--volume", type=float, default=-30.0, help="tone level in dBFS (default -30)")
+    ap.add_argument("--monitor", type=float, help="with --pcm: direct monitoring of analog in 1/2 at this level (dB, max -6)")
     ap.add_argument("--pcm", action="store_true", help="after boot, build the PC playback graph and set the ALSA route")
     ap.add_argument("--tone", type=float, help="after boot, play a full-scale sine of this frequency on analog out 1/2")
     ap.add_argument("--irq", action="store_true", help="reg1 = 0x11 (block IRQ); needs the snd-pulsar ISR")
