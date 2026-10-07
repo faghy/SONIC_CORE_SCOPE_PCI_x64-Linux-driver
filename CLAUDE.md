@@ -179,4 +179,12 @@ sudo rmmod snd-pulsar
    udev rule /etc/udev/rules.d/70-snd-pulsar.rules -> snd-pulsar@hwC<n>D0.service (pulsar-start: loader boot + alsactl restore).
    After reboot check: `systemctl status 'snd-pulsar@*'`, `journalctl -b -u 'snd-pulsar@*'`, `wpctl status` (Pulsar2 sink/source),
    `amixer -c Pulsar2 contents`. Repo test scripts (pulsar_test.sh reload/insmod) would now fight the installed module.
+4d. **pulsard DAEMON: WORKING (2026-10-07), driver 0.1.1.** snd-pulsar@.service now runs `tools/pulsard.py` (Type=notify,
+   stays alive, owns the hwdep): boots the card + default graph, then serves JSON-lines on /run/pulsard.sock (group audio):
+   status / catalog / load / unload / connect / disconnect / set (`pulsarctl` CLI in /usr/bin). Verified on hardware: CSineR4 +
+   LINVOL loaded at runtime on DSP2 (auto-picked), wired cross-DSP into Mix L on DSP1, audible; unload restores.
+   After set_controls every DSP frame goes through PULSAR_IOCTL_SEND_MSG (kernel fifo_mutex): the kernel also writes the FIFO
+   (mixer), and a userspace-cached write index went stale ("command FIFO stalled").
+   Default graph node ids: pc_play, pc_rec, n1 Analog Init, n2 Analog Out, n3 Analog In, n4/n7 PC Volume L/R,
+   n5/n8 Monitor Volume L/R, n6/n9 Mix L/R. Next: stage 2 = Qt (PySide6) GUI "Pulsar Scope" talking to pulsard.
 5. **Next:** ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), JACK/Ardour check, .deb package, then the SCOPE-like config app.

@@ -339,6 +339,7 @@ class Board(ClockMixin):
         self.sleep = (lambda ms: None) if dry_run else sim_sleep_ms
         self.sysmsg_addr = [None] * NUM_DSP   # OS symbol sysMsg per DSP
         self.syms = {}
+        self.kernel_fifo = False            # True once the kernel owns the command FIFO (after set_controls)
 
     # ---- control registers (FUN_10c20440 / 10c204b0 / 10c204e0 / 10c20470)
     def reg_rd(self, i):
@@ -358,10 +359,24 @@ class Board(ClockMixin):
         self.set_reg(i, (self.shadow[i] & ~m) | (v & m))
 
     # ---- command FIFO, as scScope.sys SendMsgBuf @0x18000f570
+    def _kernel_send(self, words):
+        """PULSAR_IOCTL_SEND_MSG: once the kernel also writes the FIFO (mixer controls), every frame must go
+        through it so that both writers are serialized and share one write index."""
+        import fcntl
+        buf = struct.pack("<I%dI" % len(words), len(words), *words) + bytes(4 * (62 - len(words)))
+        req = (1 << 30) | (len(buf) << 16) | (ord("P") << 8) | 0x04     # _IOW('P', 4, struct pulsar_msg)
+        try:
+            fcntl.ioctl(self.bar.fd, req, buf)
+        except OSError as e:
+            raise LoaderError("PULSAR_IOCTL_SEND_MSG failed: %s" % e)
+
     def fifo_init(self, wr):
         self.fifo_wr = wr & (FIFO_LEN - 1)
 
     def fifo_send(self, words):
+        if self.kernel_fifo:
+            self._kernel_send(words)
+            return
         n = len(words)
         deadline = time.monotonic() + 1.0
         while True:
@@ -811,7 +826,7 @@ def _gain(db):
     return min(0x7FFFFFFF, int(round(10 ** (db / 20.0) * 0x7FFFFFFF)))
 
 
-def setup_pcm(b, dsp_dir, rate, volume_db=-30.0, block=1024, monitor_db=None):
+def setup_pcm(b, dsp_dir, rate, volume_db=-30.0, block=1024, monitor_db=None, rack=None):
     """Analog graph on DSP1, then SET_ROUTE (docs/pcm_streaming.md 5.6):
          PC slot 0x180/0x181 -> LINVOL (volume_db) ---------------------> P2_ANO L/R
          P2_ANI L/R -> capture slots (to the host)
@@ -821,9 +836,9 @@ def setup_pcm(b, dsp_dir, rate, volume_db=-30.0, block=1024, monitor_db=None):
          ANI -> LINVOL (monitor_db + 6) --/
     """
     import pulsar_modules as pm
-    rack = pm.Rack(dsp_dir)
+    rack = rack or pm.Rack(dsp_dir)
     mod = lambda name, dsp=1: rack.load(os.path.join(dsp_dir, name), dsp)
-    _, ops = mod("P2_AINIT.dsp", 0)
+    ainit, ops = mod("P2_AINIT.dsp", 0)
     ano, o = mod("P2_ANO.dsp")
     ops += o
     # capture: P2_ANI LOut/ROut -> own comm slots in DSP1's sync block, copied to the host by the card
@@ -835,7 +850,7 @@ def setup_pcm(b, dsp_dir, rate, volume_db=-30.0, block=1024, monitor_db=None):
         ops += o
         cap_slots.append((addr - 0xC000) // 2)
     mix_comp = 6.0 if monitor_db is not None else 0.0                  # ADD2N halves both inputs
-    pc_vols, mon_vols = [], []
+    pc_vols, mon_vols, adds = [], [], []
     for ch, slot in enumerate(PLAY_SLOTS):
         pc, o = mod("LINVOL.dsp")
         ops += o
@@ -852,6 +867,7 @@ def setup_pcm(b, dsp_dir, rate, volume_db=-30.0, block=1024, monitor_db=None):
         mon_vols.append(mon)
         add, o = mod("ADD2N.dsp")
         ops += o
+        adds.append(add)
         ops += rack.connect(pc, 0, add, 0) + rack.connect(mon, 0, add, 1) + rack.connect(add, 0, ano, ch)
     if b.verbose:
         print(pm.format_ops(ops))
@@ -864,11 +880,15 @@ def setup_pcm(b, dsp_dir, rate, volume_db=-30.0, block=1024, monitor_db=None):
     if mon_vols:
         ctls.append(("Input Monitor Playback Volume", 1, [m.value_slots[1] for m in mon_vols], monitor_db + mix_comp))
     set_controls(b.bar, ctls)
+    if isinstance(b.bar, Bar):
+        b.kernel_fifo = True                # the kernel now writes the FIFO too (mixer): go through it
     print("  playback: slots %s -> %.1f dB -> analog out 1/2"
           % (", ".join("0x%x" % s for s in PLAY_SLOTS), volume_db))
     print("  capture: analog in 1/2 (P2_ANI@DSP1) -> slots %s" % ", ".join("0x%x" % s for s in cap_slots))
     if monitor_db is not None:
         print("  direct monitor: analog in 1/2 -> analog out 1/2 at %.1f dB" % monitor_db)
+    return {"rack": rack, "ainit": ainit, "ano": ano, "ani": ani, "pc_vols": pc_vols, "mon_vols": mon_vols,
+            "adds": adds, "cap_slots": cap_slots}
 
 
 def cmd_plate(args):
@@ -923,8 +943,10 @@ def cmd_counter(args):
               % (info1[3] - info0[3], dt, (info1[3] - info0[3]) / dt, info1[4]))
 
 
-def cmd_boot(args):
-    bar = open_bar(args)
+def boot_card(args, bar=None):
+    """Reset, load the six OS images, run, check every DSP, then clock/rate (and the --pcm/--tone graph).
+    Returns (board, ok, graph) where graph is setup_pcm()'s handle dict or None."""
+    bar = bar or open_bar(args)
     b = Board(bar, verbose=args.verbose, dry_run=args.dry_run)
     print("[1/5] open/init registers")
     b.open_init()
@@ -938,7 +960,7 @@ def cmd_boot(args):
     print("[4/5] run")
     b.run(bus_master=args.bus_master)
     print("[5/5] GetValue(dspID) round-trip")
-    ok = True
+    ok, graph = True, None
     for dsp in range(NUM_DSP):
         try:
             v = b.get_value(dsp, syms[dsp]["dspID"])
@@ -956,10 +978,16 @@ def cmd_boot(args):
             if not (args.irq and args.bus_master):
                 raise LoaderError("--pcm needs --irq and --bus-master")
             print("[pcm] playback graph + ALSA route")
-            setup_pcm(b, args.dsp_dir, args.rate, args.volume, monitor_db=args.monitor)
+            graph = setup_pcm(b, args.dsp_dir, args.rate, args.volume, monitor_db=args.monitor)
         elif args.tone:
             print("[tone] sine %g Hz, %.1f dB -> P-Plate analog out 1/2" % (args.tone, args.volume))
             play_tone(b, args.dsp_dir, args.tone, args.rate, args.volume)
+    return b, ok, graph
+
+
+def cmd_boot(args):
+    b, ok, _ = boot_card(args)
+    bar = b.bar
     print("FIFO wr=0x%x rd=0x%x, reg0=0x%08x" % (b.fifo_wr, bar.rd(2) & 0x3FF, bar.rd(0)))
     if args.dry_run:
         print("dry run: all BAR writes logged to %s" % args.log)

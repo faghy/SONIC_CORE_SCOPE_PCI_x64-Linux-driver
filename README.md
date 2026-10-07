@@ -1,76 +1,85 @@
-# Driver Linux per Creamware / Sonic Core Pulsar II (snd-pulsar)
+# Linux driver for the Creamware / Sonic Core Pulsar II (snd-pulsar)
 
-Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `14b5:0600`, 6× SHARC ADSP-21065L).
-È sviluppato tramite reverse engineering del software Windows SCOPE 5.1: il driver kernel `scScope.sys` e la libreria `Sim2k.dll`.
+**English** | [Italiano](README.it.md)
 
-## Stato
+A Linux driver for the **Creamware / Sonic Core Pulsar II** DSP sound card (PCI `14b5:0600`, 6× Analog Devices
+SHARC ADSP-21065L). It was written by reverse engineering the Windows SCOPE 5.1 software: the kernel driver
+`scScope.sys` and the `Sim2k.dll` library.
 
-| Funzione | Stato |
+## Status
+
+| Feature | Status |
 |---|---|
-| Rilevamento PCI, mappatura BAR0, IRQ | funziona |
-| Avvio dei 6 DSP (caricamento OS `puls2os*.21k`) | **funziona**: ogni DSP risponde |
-| Clock audio interno 44,1 kHz | **funziona** (verificato: 44.095 campioni/s) |
-| 48 kHz | **funziona** (predefinito, come PipeWire) |
-| Clock esterno | implementato, non ancora testato |
-| Caricamento moduli DSP (linker), uscite analogiche | **funziona**: tono di prova sulle uscite 1/2 |
-| Riproduzione audio dal PC (ALSA PCM, PipeWire) | **funziona**: uscita "Pulsar2 Stereo" |
-| Registrazione dagli ingressi analogici 1/2 | **funziona**: ingresso "Pulsar2 Stereo" |
-| Monitor diretto ingressi → uscite, volumi in `alsamixer` | **funziona**: "DSP Out", "Input Monitor" |
-| Installazione con avvio automatico (DKMS + servizio systemd) | **funziona**: la scheda parte da sola all'accensione |
-| ADAT/S/PDIF/MIDI, verifica JACK/Ardour, app di configurazione | da fare |
+| PCI detection, BAR0 mapping, IRQ | working |
+| Boot of the 6 DSPs (`puls2os*.21k` OS images) | **working**: every DSP answers |
+| Internal audio clock at 44.1 kHz | **working** (measured: 44,095 samples/s) |
+| 48 kHz | **working** (default, same as PipeWire) |
+| External clock | implemented, not yet tested |
+| DSP module loading (linker), analog outputs | **working**: test tone on outputs 1/2 |
+| Playback from the PC (ALSA PCM, PipeWire) | **working**: "Pulsar2 Stereo" output |
+| Recording from analog inputs 1/2 | **working**: "Pulsar2 Stereo" input |
+| Direct input → output monitoring, levels in `alsamixer` | **working**: "DSP Out", "Input Monitor" |
+| Installation with automatic start-up (DKMS + systemd service) | **working**: the card starts by itself at boot |
+| `pulsard` daemon: DSP modules loaded and wired while the card runs (`pulsarctl`) | **working** |
+| "Pulsar Scope" GUI (Qt), ADAT/S/PDIF/MIDI, JACK/Ardour check | to do |
 
-## Architettura
+## Architecture
 
-Come su Windows, il driver kernel si limita a esporre l'hardware. L'avvio dei DSP avviene da userspace:
+As on Windows, the kernel driver only exposes the hardware; the DSPs are booted from userspace:
 
-- **`snd-pulsar.ko`**: modulo kernel. Rileva la scheda e gestisce l'IRQ. Il device hwdep `/dev/snd/hwC<n>D0` permette `mmap` della BAR0 (4 MB).
-  Il dispositivo PCM ALSA viene creato quando il loader ha caricato i moduli DSP (ioctl `PULSAR_IOCTL_SET_ROUTE`).
-- **`tools/pulsar_loader.py`**: reset della scheda, caricamento degli OS dei DSP, avvio e configurazione del clock.
-- **`tools/sc_decode.py`**: decodifica i file DSP di SCOPE (`.21k`/`.dsp`/`.ol`, COFF Analog Devices offuscati).
-- **`tools/pulsar_modules.py`**: linker dei moduli DSP (rilocazione, caricamento, catena di esecuzione, collegamenti).
-- **`tools/scope_dev.py`**: decodifica i file dispositivo di SCOPE (`.io`/`.dev`/`.mdl`/`.pro`).
-- **`tools/sharc_dis.py`**: disassemblatore SHARC (port di `sharc_dasm.cpp` di MAME, BSD-3).
-- **`docs/`**: note di reverse engineering (mappa registri, protocollo dei comandi, sequenza di boot, clock).
+- **`snd-pulsar.ko`**: kernel module. It detects the card and handles the IRQ. The hwdep device
+  `/dev/snd/hwC<n>D0` allows `mmap` of BAR0 (4 MB). The ALSA PCM device is created once the DSP modules are
+  loaded (`PULSAR_IOCTL_SET_ROUTE` ioctl). ALSA mixer controls are backed by DSP module values.
+- **`tools/pulsar_loader.py`**: card reset, DSP OS upload, start-up and clock configuration.
+- **`tools/sc_decode.py`**: decoder for SCOPE DSP files (`.21k`/`.dsp`/`.ol`, scrambled Analog Devices COFF).
+- **`tools/pulsar_modules.py`**: DSP module linker (relocation, upload, execution chain, connections).
+- **`tools/scope_dev.py`**: decoder for SCOPE device files (`.io`/`.dev`/`.mdl`/`.pro`).
+- **`tools/pulsard.py`** + **`tools/pulsarctl.py`**: daemon that owns the card after boot and accepts commands
+  (`pulsarctl status`, `load`, `connect`, `set`, `unload`) on the `/run/pulsard.sock` socket (group `audio`).
+- **`tools/sharc_dis.py`**: SHARC disassembler (port of MAME's `sharc_dasm.cpp`, BSD-3).
+- **`docs/`**: reverse-engineering notes (register map, command protocol, boot sequence, clock, streaming).
 
-## File DSP (non inclusi)
+## DSP files (not included)
 
-I file DSP sono di proprietà di Sonic Core e **non sono distribuiti** in questo repository.
-Servono l'installer ufficiale `SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe` e una licenza valida.
-Estrai l'installer con `innoextract` in una cartella `scope_full` accanto al repository:
+The DSP files belong to Sonic Core and are **not distributed** in this repository. You need the official
+installer `SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe` and a valid licence. Extract it with `innoextract` into a
+`scope_full` folder next to the repository:
 ```bash
 innoextract -d ../scope_full SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe
 ```
-In alternativa puoi indicare la cartella `App/Dsp` con la variabile `PULSAR_DSP_DIR`.
+Alternatively, point the `PULSAR_DSP_DIR` variable to its `App/Dsp` folder.
 
-## Installazione (avvio automatico)
-
-```bash
-sudo ./install.sh --dsp-from ../scope_full/app/App/Dsp     # oppure --dsp-from SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe
-```
-Lo script installa le dipendenze (`dkms`, header del kernel) e il driver tramite DKMS, che lo ricompila a ogni
-aggiornamento del kernel. Installa anche gli strumenti in `/usr/lib/snd-pulsar`, i file DSP in
-`/var/lib/snd-pulsar/dsp` e il servizio `snd-pulsar@.service`. Il servizio parte da solo quando la scheda viene
-rilevata e avvia DSP, clock, audio e monitor. Le impostazioni stanno in `/etc/default/snd-pulsar`, i log si leggono
-con `journalctl -u 'snd-pulsar@*'`. Disinstallazione: `sudo ./uninstall.sh` (`--purge` rimuove anche i file DSP).
-
-## Compilazione e test
+## Installation (automatic start-up)
 
 ```bash
-make                                   # usa /lib/modules/$(uname -r)/build
-pkexec tools/pulsar_test.sh boot       # carica il modulo, avvia i DSP, imposta 44,1 kHz
-pkexec tools/pulsar_test.sh clock      # misura il word clock dei DSP
-pkexec tools/pulsar_test.sh boot --tone 440 --volume -40   # tono di prova sulle uscite analogiche 1/2
-pkexec tools/pulsar_test.sh reload boot --bus-master --irq --pcm --monitor -12   # scheda audio ALSA/PipeWire + monitor
-alsamixer -c 2                         # volumi "DSP Out" e "Input Monitor"
-tools/pulsar_loader.py boot --dry-run  # simulazione senza hardware
+sudo ./install.sh --dsp-from ../scope_full/app/App/Dsp     # or --dsp-from SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe
 ```
-Altri comandi di `pulsar_test.sh` (tutti richiedono root):
-- `info`: legge registri e stato della scheda;
-- `diag`: diagnostica sullo stato del bus tra i DSP e della SRAM condivisa;
-- `dump`: salva su file i registri e la SRAM della scheda;
-- `peek --dsp N --sym NOME`: legge una variabile dall'OS di un DSP in esecuzione;
-- `clock`: misura il word clock dei DSP.
+The script installs the dependencies (`dkms`, kernel headers) and the driver through DKMS, which rebuilds it on
+every kernel update. It also installs the tools in `/usr/lib/snd-pulsar`, the DSP files in
+`/var/lib/snd-pulsar/dsp` and the `snd-pulsar@.service` unit. The service starts by itself when the card is
+detected and brings up the DSPs, clock, audio and monitoring. Settings live in `/etc/default/snd-pulsar`; logs
+are available with `journalctl -u 'snd-pulsar@*'`. Uninstall with `sudo ./uninstall.sh` (`--purge` also removes
+the DSP files).
 
-## Licenza
+## Building and testing
 
-GPL-2.0-or-later (driver kernel). `tools/sharc_dis.py` deriva da MAME (BSD-3-Clause).
+```bash
+make                                   # uses /lib/modules/$(uname -r)/build
+pulsarctl status                       # with the service installed: card and module status
+pkexec tools/pulsar_test.sh boot       # load the module, boot the DSPs and the clock
+pkexec tools/pulsar_test.sh clock      # measure the DSP word clock
+pkexec tools/pulsar_test.sh boot --tone 440 --volume -40   # test tone on analog outputs 1/2
+pkexec tools/pulsar_test.sh reload boot --bus-master --irq --pcm --monitor -12   # ALSA/PipeWire card + monitoring
+alsamixer -c Pulsar2                   # "DSP Out" and "Input Monitor" levels
+tools/pulsar_loader.py boot --dry-run  # simulation without hardware
+```
+Other `pulsar_test.sh` commands (all need root):
+- `info`: reads the card registers and state;
+- `diag`: diagnostics of the inter-DSP bus and the shared SRAM;
+- `dump`: saves the card registers and SRAM to a file;
+- `peek --dsp N --sym NAME`: reads a variable from the OS of a running DSP;
+- `clock`: measures the DSP word clock.
+
+## Licence
+
+GPL-2.0-or-later (kernel driver). `tools/sharc_dis.py` is derived from MAME (BSD-3-Clause).

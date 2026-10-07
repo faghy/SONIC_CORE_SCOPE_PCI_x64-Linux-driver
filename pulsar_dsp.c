@@ -40,6 +40,19 @@ static int fifo_send(struct pulsar_card *chip, const u32 *w, unsigned int n)
 	return 0;
 }
 
+/* Raw frame(s) from userspace (pulsard), serialized with the kernel's own SetValue. */
+int pulsar_dsp_send(struct pulsar_card *chip, const u32 *words, unsigned int n)
+{
+	int err;
+
+	if (!n || n > PULSAR_MSG_MAX_WORDS)
+		return -EINVAL;
+	mutex_lock(&chip->fifo_mutex);
+	err = fifo_send(chip, words, n);
+	mutex_unlock(&chip->fifo_mutex);
+	return err;
+}
+
 /* SetValue on a DSP whose OS is running (state 2): one wrapped single-word frame. */
 int pulsar_dsp_set_value(struct pulsar_card *chip, unsigned int dsp, u32 addr, u32 val)
 {

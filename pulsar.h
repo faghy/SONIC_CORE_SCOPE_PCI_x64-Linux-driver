@@ -119,6 +119,7 @@ int pulsar_pcm_set_route(struct pulsar_card *chip, const struct pulsar_pcm_route
 void pulsar_pcm_interrupt(struct pulsar_card *chip);
 void pulsar_pcm_quiesce(struct pulsar_card *chip);
 int pulsar_dsp_set_value(struct pulsar_card *chip, unsigned int dsp, u32 addr, u32 val);
+int pulsar_dsp_send(struct pulsar_card *chip, const u32 *words, unsigned int n);
 int pulsar_mixer_set_controls(struct pulsar_card *chip, const struct pulsar_controls *pc);
 int pulsar_hwdep_create(struct pulsar_card *chip);
 

@@ -58,9 +58,18 @@ struct pulsar_controls {
 	struct pulsar_ctl_desc ctl[PULSAR_MAX_CONTROLS];
 };
 
+/* Raw host->DSP message frame(s) for the command FIFO, serialized with the kernel's own SetValue */
+#define PULSAR_MSG_MAX_WORDS   62
+
+struct pulsar_msg {
+	__u32 count;
+	__u32 words[PULSAR_MSG_MAX_WORDS];
+};
+
 #define PULSAR_IOCTL_MAGIC     'P'
 #define PULSAR_IOCTL_GET_INFO  _IOR(PULSAR_IOCTL_MAGIC, 0x01, struct pulsar_info)
 #define PULSAR_IOCTL_SET_ROUTE _IOW(PULSAR_IOCTL_MAGIC, 0x02, struct pulsar_pcm_route)
 #define PULSAR_IOCTL_SET_CONTROLS _IOW(PULSAR_IOCTL_MAGIC, 0x03, struct pulsar_controls)
+#define PULSAR_IOCTL_SEND_MSG  _IOW(PULSAR_IOCTL_MAGIC, 0x04, struct pulsar_msg)
 
 #endif /* _PULSAR_UAPI_H_ */

@@ -66,7 +66,8 @@ install -D -m 0644 "$REPO/pulsar_uapi.h" /usr/include/sound/pulsar_uapi.h
 step "4/5 tools and boot service"
 install -d "$LIB/tools"
 install -m 0644 "$REPO"/tools/*.py "$LIB/tools/"
-install -m 0755 "$REPO/tools/pulsar_loader.py" "$LIB/tools/"
+install -m 0755 "$REPO/tools/pulsar_loader.py" "$REPO/tools/pulsard.py" "$REPO/tools/pulsarctl.py" "$LIB/tools/"
+ln -sf "$LIB/tools/pulsarctl.py" /usr/bin/pulsarctl
 install -m 0755 "$REPO/packaging/pulsar-start" "$LIB/"
 install -m 0644 "$REPO/packaging/snd-pulsar@.service" /etc/systemd/system/
 install -m 0644 "$REPO/packaging/70-snd-pulsar.rules" /etc/udev/rules.d/

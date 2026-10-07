@@ -10,7 +10,7 @@ for v in $(dkms status snd-pulsar 2>/dev/null | sed -n 's|^snd-pulsar/\([^,:]*\)
 	dkms remove -m snd-pulsar -v "$v" --all
 	rm -rf "/usr/src/snd-pulsar-$v"
 done
-rm -rf /usr/lib/snd-pulsar /usr/include/sound/pulsar_uapi.h
+rm -rf /usr/lib/snd-pulsar /usr/include/sound/pulsar_uapi.h /usr/bin/pulsarctl /var/cache/pulsard
 if [ "${1:-}" = "--purge" ]; then
 	rm -rf /var/lib/snd-pulsar /etc/default/snd-pulsar
 fi

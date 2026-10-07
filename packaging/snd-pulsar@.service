@@ -1,14 +1,15 @@
 [Unit]
-Description=Creamware / Sonic Core Pulsar II DSP boot (%I)
+Description=Creamware / Sonic Core Pulsar II DSP daemon (%I)
 Documentation=https://github.com/faghy/SONIC_CORE_SCOPE_PCI_x64-Linux-driver
 BindsTo=dev-snd-%i.device
 After=dev-snd-%i.device
 Before=display-manager.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=notify
+NotifyAccess=main
 EnvironmentFile=-/etc/default/snd-pulsar
 ExecStart=/usr/lib/snd-pulsar/pulsar-start /dev/snd/%I
 ExecStop=-/usr/sbin/alsactl store Pulsar2
 TimeoutStartSec=120
+Restart=no

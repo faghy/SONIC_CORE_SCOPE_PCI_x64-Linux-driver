@@ -27,6 +27,7 @@ static int pulsar_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 	struct pulsar_info info = {};
 	struct pulsar_pcm_route route;
 	struct pulsar_controls *ctls;
+	struct pulsar_msg *msg;
 	int err;
 
 	switch (cmd) {
@@ -40,6 +41,13 @@ static int pulsar_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 			return PTR_ERR(ctls);
 		err = pulsar_mixer_set_controls(chip, ctls);
 		kfree(ctls);
+		return err;
+	case PULSAR_IOCTL_SEND_MSG:
+		msg = memdup_user((void __user *)arg, sizeof(*msg));
+		if (IS_ERR(msg))
+			return PTR_ERR(msg);
+		err = msg->count > PULSAR_MSG_MAX_WORDS ? -EINVAL : pulsar_dsp_send(chip, msg->words, msg->count);
+		kfree(msg);
 		return err;
 	case PULSAR_IOCTL_GET_INFO:
 		info.board_raw_id = chip->board_raw_id;
