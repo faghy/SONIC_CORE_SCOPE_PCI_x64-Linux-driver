@@ -1,0 +1,3 @@
+# Creamware / Sonic Core Pulsar II: boot the DSPs as soon as the snd-pulsar hwdep device appears
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="hwC*D0", ATTRS{vendor}=="0x14b5", ATTRS{device}=="0x0600", \
+  TAG+="systemd", ENV{SYSTEMD_WANTS}+="snd-pulsar@%k.service"

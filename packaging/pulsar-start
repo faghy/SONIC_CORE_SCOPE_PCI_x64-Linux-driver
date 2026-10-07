@@ -1,0 +1,10 @@
+#!/bin/sh
+# Boot the Pulsar II DSPs and build the audio graph (run by snd-pulsar@.service as root).
+set -e
+HWDEP="$1"
+: "${PULSAR_DSP_DIR:=/var/lib/snd-pulsar/dsp}"
+export PULSAR_DSP_DIR
+# shellcheck disable=SC2086
+python3 -I /usr/lib/snd-pulsar/tools/pulsar_loader.py boot --bus-master --irq $PULSAR_ARGS --resource "$HWDEP"
+# restore the mixer levels saved at the last shutdown (the controls only exist after the boot above)
+alsactl restore Pulsar2 2>/dev/null || true

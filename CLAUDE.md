@@ -45,7 +45,7 @@ the hwdep device `/dev/snd/hwC<n>D0` can be mmap()ed, and `tools/pulsar_loader.p
 | `0x04` | reg1 | R: IRQ status. W: IRQ/block-size config (`0x11` = IRQ every 1024 samples) |
 | `0x08` | reg2 | R: command-FIFO card read index (`&0x3ff`). W: clock control bits |
 | `0x0C` | reg3 | W: command-FIFO host write index |
-| `0x10` | reg4 | R: free-running counter, NOT 1:1 with samples (~11.6k/s at 44.1k, small wrap) |
+| `0x10` | reg4 | R: 1:1 frame counter, 15 bit (wraps at 0x8000); ring index = `& 0xfff` |
 | `0x14` | reg5 | W: audio cfg serial bit-bang (data 0x400, clock 0x800, latch 0x100) |
 | `0x1C` | reg7 | W: write 0 to ack IRQ |
 | `0x20` | reg8 | W: active slot-table bank |
@@ -69,8 +69,9 @@ The `(cmd<<26)|(len<<22)|0xA0000|addr` format is the SPI path used only by Xite 
 Repository root = `linux-driver/` (GitHub: faghy/SONIC_CORE_SCOPE_PCI_x64-Linux-driver). Kernel module `snd-pulsar`:
   - `pulsar_core.c`: devm-managed probe, BAR map, board id, shared IRQ handler (Windows-exact ack/check).
   - `pulsar_hwdep.c` + `pulsar_uapi.h`: hwdep device, `mmap` of BAR0 (needs CAP_SYS_RAWIO), `PULSAR_IOCTL_GET_INFO`.
-  - `pulsar_pcm.c`: placeholder PCM, NOT functional (no DMA). Only registered with `enable_pcm=1`,
-    so PipeWire does not route desktop audio to a silent sink.
+  - `pulsar_pcm.c`: zero-copy PCM over the card's slot engine, created on PULSAR_IOCTL_SET_ROUTE.
+  - `pulsar_dsp.c` (kernel SetValue via command FIFO), `pulsar_mixer.c` (DSP-backed ALSA volume controls).
+  - `install.sh` / `uninstall.sh` / `packaging/`: DKMS + udev + snd-pulsar@.service auto-start.
 - `tools/sharc_dis.py`: SHARC disassembler (port of MAME sharc_dasm, BSD-3).
 - `tools/pulsar_test.sh`: root test wrapper, run with `pkexec tools/pulsar_test.sh <info|diag|dump|peek|clock|boot>`.
 - `tools/sc_decode.py`: DSP file descrambler + COFF dumper.
@@ -125,7 +126,8 @@ cd /home/faghy/puksar2/linux-driver
 
 ### Build command:
 ```bash
-make -C /home/faghy/.gemini/antigravity-cli/brain/b1d9e742-e8fc-4d70-832c-3b2941e40f15/scratch/kheaders/usr/src/linux-headers-6.12.111+deb13-amd64 M=$(pwd) PAHOLE=true modules
+make            # kernel headers are now installed system-wide (linux-headers-amd64)
+sudo ./install.sh --dsp-from ../scope_full/app/App/Dsp   # reinstall via DKMS after changes, then reboot
 ```
 
 ### Load & Unload commands:
@@ -170,6 +172,10 @@ sudo rmmod snd-pulsar
    "DSP Out Playback Volume" and "Input Monitor Playback Volume" = LINVOL Vol slots, written by the kernel via the command
    FIFO (pulsar_dsp.c); deliberately NOT named "PCM" so PipeWire keeps software volume and cannot lift the safety gain.
    Test workflow: `systemctl --user stop wireplumber` before reload/boot (it holds the card), start it again afterwards.
-5. **Next:** 48 kHz test,
-   packaging (DKMS + systemd unit running the loader at boot + script extracting DSP files from the user's installer),
-   then the SCOPE-like config app.
+4c. **AUTO-START PACKAGE: WORKING after reboot (2026-10-07).** Service snd-pulsar@hwC0D0 (card index can change) boots the card in ~1.1 s; GNOME shows Pulsar2 output+input; alsactl restored the saved mixer levels. `sudo ./install.sh --dsp-from
+   ../scope_full/app/App/Dsp` installed: DKMS snd-pulsar 0.1.0 (/usr/src/snd-pulsar-0.1.0, signed with /var/lib/dkms/mok.key),
+   tools in /usr/lib/snd-pulsar, DSP files in /var/lib/snd-pulsar/dsp, /etc/default/snd-pulsar (PULSAR_ARGS),
+   udev rule /etc/udev/rules.d/70-snd-pulsar.rules -> snd-pulsar@hwC<n>D0.service (pulsar-start: loader boot + alsactl restore).
+   After reboot check: `systemctl status 'snd-pulsar@*'`, `journalctl -b -u 'snd-pulsar@*'`, `wpctl status` (Pulsar2 sink/source),
+   `amixer -c Pulsar2 contents`. Repo test scripts (pulsar_test.sh reload/insmod) would now fight the installed module.
+5. **Next:** 48 kHz test, ADAT/S/PDIF/MIDI, JACK/Ardour check, .deb package, then the SCOPE-like config app.

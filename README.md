@@ -15,7 +15,8 @@ Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `
 | Riproduzione audio dal PC (ALSA PCM, PipeWire) | **funziona**: uscita "Pulsar2 Stereo" |
 | Registrazione dagli ingressi analogici 1/2 | **funziona**: ingresso "Pulsar2 Stereo" |
 | Monitor diretto ingressi → uscite, volumi in `alsamixer` | **funziona**: "DSP Out", "Input Monitor" |
-| Pacchetto installabile (avvio automatico), JACK/Ardour, 48 kHz | da fare |
+| Installazione con avvio automatico (DKMS + servizio systemd) | **funziona**: la scheda parte da sola all'accensione |
+| 48 kHz, ADAT/S/PDIF/MIDI, verifica JACK/Ardour, app di configurazione | da fare |
 
 ## Architettura
 
@@ -39,6 +40,17 @@ Estrai l'installer con `innoextract` in una cartella `scope_full` accanto al rep
 innoextract -d ../scope_full SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe
 ```
 In alternativa puoi indicare la cartella `App/Dsp` con la variabile `PULSAR_DSP_DIR`.
+
+## Installazione (avvio automatico)
+
+```bash
+sudo ./install.sh --dsp-from ../scope_full/app/App/Dsp     # oppure --dsp-from SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe
+```
+Lo script installa le dipendenze (`dkms`, header del kernel) e il driver tramite DKMS, che lo ricompila a ogni
+aggiornamento del kernel. Installa anche gli strumenti in `/usr/lib/snd-pulsar`, i file DSP in
+`/var/lib/snd-pulsar/dsp` e il servizio `snd-pulsar@.service`. Il servizio parte da solo quando la scheda viene
+rilevata e avvia DSP, clock, audio e monitor. Le impostazioni stanno in `/etc/default/snd-pulsar`, i log si leggono
+con `journalctl -u 'snd-pulsar@*'`. Disinstallazione: `sudo ./uninstall.sh` (`--purge` rimuove anche i file DSP).
 
 ## Compilazione e test
 
