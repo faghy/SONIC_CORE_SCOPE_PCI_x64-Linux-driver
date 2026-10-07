@@ -11,7 +11,7 @@ Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `
 | Avvio dei 6 DSP (caricamento OS `puls2os*.21k`) | **funziona**: ogni DSP risponde |
 | Clock audio interno 44,1 kHz | **funziona** (verificato: 44.095 campioni/s) |
 | 48 kHz, clock esterno | implementato, non ancora testato |
-| Caricamento moduli DSP (I/O analogico, routing) | da fare |
+| Caricamento moduli DSP (linker), uscite analogiche | **funziona**: tono di prova sulle uscite 1/2 |
 | Streaming audio PC ↔ scheda (ALSA PCM, JACK/PipeWire, Ardour) | da fare |
 
 ## Architettura
@@ -22,6 +22,8 @@ Come su Windows, il driver kernel si limita a esporre l'hardware. L'avvio dei DS
   Il PCM ALSA è un segnaposto disattivato di default (`enable_pcm=1` per abilitarlo).
 - **`tools/pulsar_loader.py`**: reset della scheda, caricamento degli OS dei DSP, avvio e configurazione del clock.
 - **`tools/sc_decode.py`**: decodifica i file DSP di SCOPE (`.21k`/`.dsp`/`.ol`, COFF Analog Devices offuscati).
+- **`tools/pulsar_modules.py`**: linker dei moduli DSP (rilocazione, caricamento, catena di esecuzione, collegamenti).
+- **`tools/scope_dev.py`**: decodifica i file dispositivo di SCOPE (`.io`/`.dev`/`.mdl`/`.pro`).
 - **`tools/sharc_dis.py`**: disassemblatore SHARC (port di `sharc_dasm.cpp` di MAME, BSD-3).
 - **`docs/`**: note di reverse engineering (mappa registri, protocollo dei comandi, sequenza di boot, clock).
 
@@ -41,6 +43,7 @@ In alternativa puoi indicare la cartella `App/Dsp` con la variabile `PULSAR_DSP_
 make                                   # usa /lib/modules/$(uname -r)/build
 pkexec tools/pulsar_test.sh boot       # carica il modulo, avvia i DSP, imposta 44,1 kHz
 pkexec tools/pulsar_test.sh clock      # misura il word clock dei DSP
+pkexec tools/pulsar_test.sh boot --tone 440 --volume -40   # tono di prova sulle uscite analogiche 1/2
 tools/pulsar_loader.py boot --dry-run  # simulazione senza hardware
 ```
 Altri comandi di `pulsar_test.sh` (tutti richiedono root):

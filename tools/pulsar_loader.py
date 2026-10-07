@@ -411,7 +411,7 @@ class Board(ClockMixin):
             print("DSP%x: SetValue (0x%x, 0x%x)" % (dsp, addr, val))
         self.send_msg(((dsp | 0x10) << 21) | addr, [val])
 
-    # ---- UploadCode, FUN_10c2d310 (states 0 and 1)
+    # ---- UploadCode, FUN_10c2d310 (states 0, 1 and 2)
     def upload_code(self, dsp, data, addr, n):
         instr = [data[6 * i:6 * i + 6] for i in range(n)]
         st = self.state[dsp]
@@ -425,8 +425,33 @@ class Board(ClockMixin):
             self.sleep(10)
             self.bit_clr(0, 0x20)
             return
+        if st == 2:
+            # OS running (asm 10c2d60c..10c2d7de): chunks of 10 instructions, each one batched message
+            # [batch start, IOP 48-bit DMA setup, code frame, IOP back to 32-bit/stride 2, closing IOP].
+            for off in range(0, n, 10):
+                cnt = min(10, n - off)
+                words = []
+                for k in range(off, off + cnt, 2):
+                    a = instr[k]
+                    if k + 1 < off + cnt:
+                        b = instr[k + 1]
+                        words += [int.from_bytes(a[0:4], "big"), int.from_bytes(b[4:6] + a[4:6], "big"),
+                                  int.from_bytes(b[0:4], "big")]
+                    else:
+                        words += [int.from_bytes(a[0:4], "big"), int.from_bytes(a[4:6], "big")]
+                self.send_msg((dsp << 21) | 0x120000, [], batch=True)
+                self.iop(dsp, 0x1C, 0x20E0, batch=True)
+                self.iop(dsp, 0x41, 1, batch=True)
+                self.iop(dsp, 0x1C, 0xE1, batch=True)
+                self.force_wrap = True
+                self.send_msg(((len(words) << 4 | dsp) << 21) | (addr + off), words, batch=True)
+                self.force_wrap = False
+                self.iop(dsp, 0x1C, 0x40, batch=True)
+                self.iop(dsp, 0x41, 2, batch=True)
+                self.iop(dsp, 0x12001C, 0x41)
+            return
         if st != 1:
-            raise LoaderError("UploadCode in state %d not implemented (module loading)" % st)
+            raise LoaderError("UploadCode in state %d not supported" % st)
         self.iop(dsp, 0x1C, 0x20E0)
         self.iop(dsp, 0x42, n)
         self.iop(dsp, 0x41, 1)
@@ -681,13 +706,27 @@ def cmd_peek(args):
     b = Board(bar, verbose=args.verbose, dry_run=args.dry_run)
     b.fifo_init(bar.rd(3))                 # continue from the card's current write index
     b.state = [2] * NUM_DSP
+    allsyms = {}
     for dsp in range(NUM_DSP):
         obj, _ = sc_decode.load(os.path.join(args.dsp_dir, "puls2os%d.21k" % dsp))
-        syms = {s.name: s.value for s in obj.symbols if s.scnum > 0}
-        b.sysmsg_addr[dsp] = syms["sysMsg"]
-        if dsp not in args.dsp:
-            continue
+        allsyms[dsp] = {s.name: s.value for s in obj.symbols if s.scnum > 0}
+        b.sysmsg_addr[dsp] = allsyms[dsp]["sysMsg"]
+    for rep in range(args.repeat):
+        if rep:
+            time.sleep(1.0)
+            print("--- %d s later" % rep)
+        _peek_once(b, args, allsyms)
+
+
+def _peek_once(b, args, allsyms):
+    for dsp in args.dsp:
+        syms = allsyms[dsp]
         for name in args.sym:
+            if ":" in name:
+                lo, hi = (int(x, 0) for x in name.split(":"))
+                vals = [b.get_value(dsp, a) for a in range(lo, hi)]
+                print("DSP%d: 0x%05x: %s" % (dsp, lo, " ".join("%08x" % v for v in vals)))
+                continue
             addr = int(name, 0) if name[0].isdigit() else syms.get(name)
             if addr is None:
                 print("DSP%d: %-14s (no such symbol)" % (dsp, name))
@@ -714,6 +753,42 @@ def cmd_clock(args):
     dt = t1 - t0
     print("wclk      : 0x%x -> 0x%x  = %.1f /s" % (w0, w1, ((w1 - w0) & 0xFFFFFFFF) / dt))
     print("BAR+0x10  : 0x%x -> 0x%x  = %.1f /s" % (c0, c1, ((c1 - c0) & 0xFFFFFFFF) / dt))
+
+
+def play_tone(b, dsp_dir, freq, rate, volume_db=-30.0):
+    """Audible test (docs/io_format.md 5.3): P2_AINIT on DSP0; CSineR4 -> LINVOL -> P2_ANO L/R on DSP1."""
+    import pulsar_modules as pm
+    rack = pm.Rack(dsp_dir)
+    _, ops = rack.load(os.path.join(dsp_dir, "P2_AINIT.dsp"), 0)       # pulls in PINIT.ol (codec init)
+    ano, o = rack.load(os.path.join(dsp_dir, "P2_ANO.dsp"), 1)         # pulls in P2_IO.ol (SPORT0)
+    ops += o
+    sine, o = rack.load(os.path.join(dsp_dir, "CSineR4.dsp"), 1)
+    ops += o
+    vol, o = rack.load(os.path.join(dsp_dir, "LINVOL.dsp"), 1)         # Out = In * Vol (1.31 fraction)
+    ops += o
+    gain = min(0x7FFFFFFF, int(round(10 ** (volume_db / 20.0) * 0x7FFFFFFF)))
+    ops += rack.connect(sine, 0, vol, 0)                                # Cout -> LINVOL.In
+    ops += rack.set_in_pad(vol, 1, gain)                                # LINVOL.Vol
+    ops += rack.connect(vol, 0, ano, 0)                                 # LINVOL.Out -> LIn
+    ops += rack.connect(vol, 0, ano, 1)                                 # LINVOL.Out -> RIn
+    ops += rack.set_in_pad(sine, 0, int(round(freq / rate * 2 ** 32)) & 0xFFFFFFFF)
+    if b.verbose:
+        print(pm.format_ops(ops))
+    pm.execute(b, ops)
+    b.plate_set(RATE_BITS.get(rate, 0x4))                              # cfg without 0x80: un-mute analog outs
+    print("  playing %g Hz at %.1f dB on analog out 1/2 (P2_AINIT@DSP0, P2_ANO+CSineR4+LINVOL@DSP1)"
+          % (freq, volume_db))
+
+
+def cmd_plate(args):
+    """Rewrite the backplate audio-cfg word (PPlate, 11 bits) on a running card, then read the status.
+    0x404 = 44.1 kHz internal, analog outputs live; 0x484 = same with bit 0x80 = analog outputs muted."""
+    bar = open_bar(args)
+    b = Board(bar, verbose=True, dry_run=args.dry_run)
+    b.shadow[5] = 0x4                       # reg5 after open/reset (bit 0x1000 cleared, clkSrc default)
+    b.write_audio_cfg(args.cfg)
+    st = b.read_audio_cfg()
+    print("readAudioCfg = 0x%04x%s%s" % (st, " lock(0x4)" if st & 4 else "", " HAVARIE(0x100)" if st & 0x100 else ""))
 
 
 def cmd_boot(args):
@@ -745,6 +820,9 @@ def cmd_boot(args):
         b.finish_run(irq=args.irq, rate=44100)
         if args.rate != 44100 or args.clock != "internal":
             b.set_rate(args.rate, args.clock)
+        if args.tone:
+            print("[tone] sine %g Hz, %.1f dB -> P-Plate analog out 1/2" % (args.tone, args.volume))
+            play_tone(b, args.dsp_dir, args.tone, args.rate, args.volume)
     print("FIFO wr=0x%x rd=0x%x, reg0=0x%08x" % (b.fifo_wr, bar.rd(2) & 0x3FF, bar.rd(0)))
     if args.dry_run:
         print("dry run: all BAR writes logged to %s" % args.log)
@@ -753,17 +831,21 @@ def cmd_boot(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=("info", "diag", "dump", "peek", "clock", "boot"))
+    ap.add_argument("command", choices=("info", "diag", "dump", "peek", "clock", "plate", "boot"))
     ap.add_argument("--resource", help="mmap this file instead of the hwdep device "
                                        "(e.g. /sys/bus/pci/devices/0000:06:01.0/resource0)")
     ap.add_argument("--dsp-dir", default=DEFAULT_DSP_DIR)
     ap.add_argument("--out", help="output file for dump")
     ap.add_argument("--dsp", type=int, nargs="+", default=[0], help="DSPs for peek")
-    ap.add_argument("--sym", nargs="+", default=["dspID"], help="symbols or addresses for peek")
+    ap.add_argument("--sym", nargs="+", default=["dspID"], help="symbols or addresses for peek (a:b = range)")
+    ap.add_argument("--cfg", type=lambda x: int(x, 0), default=0x404, help="plate: cfg word (default 0x404)")
+    ap.add_argument("--repeat", type=int, default=1, help="peek: read N times, 1 s apart")
     ap.add_argument("--dry-run", action="store_true", help="simulate against a fake BAR")
     ap.add_argument("--log", help="log every BAR write to this file (default for --dry-run: bar_writes.log)")
     ap.add_argument("--rate", type=int, default=44100, choices=(32000, 44100, 48000))
     ap.add_argument("--clock", default="internal", choices=("internal", "external"))
+    ap.add_argument("--volume", type=float, default=-30.0, help="tone level in dBFS (default -30)")
+    ap.add_argument("--tone", type=float, help="after boot, play a full-scale sine of this frequency on analog out 1/2")
     ap.add_argument("--irq", action="store_true", help="reg1 = 0x11 (block IRQ); needs the snd-pulsar ISR")
     ap.add_argument("--no-finish", action="store_true", help="stop after the dspID round-trip")
     ap.add_argument("--bus-master", action="store_true",
@@ -774,7 +856,7 @@ def main():
     if args.dry_run and not args.log:
         args.log = "bar_writes.log"
     try:
-        return {"info": cmd_info, "diag": cmd_diag, "dump": cmd_dump, "peek": cmd_peek, "clock": cmd_clock, "boot": cmd_boot}[args.command](args) or 0
+        return {"info": cmd_info, "diag": cmd_diag, "dump": cmd_dump, "peek": cmd_peek, "clock": cmd_clock, "plate": cmd_plate, "boot": cmd_boot}[args.command](args) or 0
     except LoaderError as e:
         print("error: %s" % e, file=sys.stderr)
         return 1

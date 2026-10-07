@@ -146,6 +146,14 @@ sudo rmmod snd-pulsar
    backplateID=2 (PPlate, 11-bit cfg word, 0x484 = 44.1k internal), uC serial via DSP5, FScale/asRatio, sysmsg 0xB, clock resync.
    Verified: DSP `wclk` advances 44095/s (`pulsar_test.sh clock`). NOTE: BAR+0x10 is NOT a 1:1 sample counter (≈11.6k/s, wraps).
    48 kHz (`--rate 48000`) implemented but not yet tested on hardware.
-3. **Module linker:** relocate + load `.dsp/.ol` modules (P2_IO, P2_AINIT, PINIT, pc2dsp/asio) and hook them
-   into the OS chain (`_firstsync`/`ret_sync`, sysmsg type 2). Next RE targets: Sim2k `FUN_10c1a760`, `FUN_10c1b170`, `FUN_10c2e250`.
+3. **Module linker: implemented offline (2026-10-07), not yet run on hardware.** Spec: docs/module_loading.md;
+   code: `tools/pulsar_modules.py` (`selftest`, `link --ops --disasm`, `dryrun`). Libraries (.ol) auto-pulled,
+   first-fit Sim2k heaps, reloc 2/3/4/6, init via sysmsg 2/7, sync chain via `ret_sync` patch (sysmsg 6 + codeBuf),
+   inputs = SetValue of seg_mod input word + patch of `inputN` sites, cross-DSP sync slots via sysmsg 0xB.
+   `Board.upload_code` now has the state-2 path. Next: run CSineR4 -> P2_ANO on hardware (`pm.execute(board, ops)`).
+3b. **FIRST AUDIO OUT (2026-10-07):** `pkexec tools/pulsar_test.sh boot --tone 440 [--volume -30]` plays a sine on
+   analog out 1/2: P2_AINIT(+PINIT.ol)@DSP0, P2_ANO(+P2_IO.ol)+CSineR4+LINVOL@DSP1 (P-Plate analog modules are fixed to DSP1).
+   KEY: PPlate cfg bit 0x80 MUTES the analog outputs. Run writes 0x484 (muted), so 0x404 (44.1k) must be written after the
+   modules are loaded. `pulsar_test.sh plate --cfg 0x484` mutes again, `--cfg 0x404` un-mutes.
+   SAFETY: CSineR4 is full scale (0 dBFS); always go through LINVOL (Out = In*Vol, 1.31 fraction).
 4. **PCM streaming:** host DMA rings + slot table at BAR+0x80000 (scScope_sys.md §audio), position from reg4.

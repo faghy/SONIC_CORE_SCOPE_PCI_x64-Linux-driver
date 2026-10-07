@@ -43,3 +43,7 @@ fi
 if [ "${1:-}" = "clock" ]; then
 	python3 -I "$REPO/tools/pulsar_loader.py" clock
 fi
+
+if [ "${1:-}" = "plate" ]; then
+	python3 -I "$REPO/tools/pulsar_loader.py" plate "${@:2}"
+fi
