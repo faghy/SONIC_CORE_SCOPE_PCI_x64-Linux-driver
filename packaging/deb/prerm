@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+NAME=snd-pulsar
+VERSION=@VERSION@
+if [ "$1" = "remove" ] || [ "$1" = "upgrade" ] || [ "$1" = "deconfigure" ]; then
+	systemctl stop 'snd-pulsar@*' >/dev/null 2>&1 || true
+	dkms remove -m $NAME -v $VERSION --all >/dev/null 2>&1 || true
+fi
+exit 0

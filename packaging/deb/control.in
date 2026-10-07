@@ -1,0 +1,16 @@
+Package: snd-pulsar
+Version: @VERSION@
+Architecture: all
+Maintainer: @MAINTAINER@
+Section: sound
+Priority: optional
+Depends: dkms, linux-headers-amd64 | linux-headers-generic | linux-headers, python3, python3-pyside6.qtwidgets, alsa-utils, udev, systemd
+Recommends: innoextract
+Homepage: https://github.com/faghy/SONIC_CORE_SCOPE_PCI_x64-Linux-driver
+Description: Linux driver and modular environment for the Creamware / Sonic Core Pulsar II
+ Kernel module (built with DKMS), DSP boot service, pulsard daemon, pulsarctl and the
+ "Pulsar Scope" modular GUI for the Creamware / Sonic Core Pulsar II PCI DSP card.
+ The card appears as an ALSA / PipeWire sound card (analog in/out, direct monitoring).
+ .
+ The Sonic Core DSP files are not included: import them once from the SCOPE PCI 5.1
+ installer with "sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe".

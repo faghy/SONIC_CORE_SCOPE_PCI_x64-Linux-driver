@@ -1,0 +1,2 @@
+#!/bin/sh
+exec python3 /usr/lib/snd-pulsar/tools/pulsar_scope.py "$@"

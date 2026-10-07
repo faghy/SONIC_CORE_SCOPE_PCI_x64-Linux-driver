@@ -70,6 +70,8 @@ install -m 0755 "$REPO/tools/pulsar_loader.py" "$REPO/tools/pulsard.py" "$REPO/t
 	"$REPO/tools/pulsar_scope.py" "$LIB/tools/"
 install -D -m 0644 "$REPO/packaging/pulsar-scope.desktop" /usr/share/applications/pulsar-scope.desktop
 ln -sf "$LIB/tools/pulsarctl.py" /usr/bin/pulsarctl
+install -m 0755 "$REPO/packaging/pulsar-scope" /usr/bin/pulsar-scope
+install -m 0755 "$REPO/packaging/pulsar-import-dsp" /usr/sbin/pulsar-import-dsp
 install -m 0755 "$REPO/packaging/pulsar-start" "$LIB/"
 install -m 0644 "$REPO/packaging/snd-pulsar@.service" /etc/systemd/system/
 install -m 0644 "$REPO/packaging/70-snd-pulsar.rules" /etc/udev/rules.d/

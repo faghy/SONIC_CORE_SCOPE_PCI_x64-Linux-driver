@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+NAME=snd-pulsar
+VERSION=@VERSION@
+if [ "$1" = "configure" ]; then
+	# drop other DKMS versions (e.g. from an older install.sh install)
+	for v in $(dkms status $NAME 2>/dev/null | sed -n "s|^$NAME/\([^,:]*\).*|\1|p" | sort -u); do
+		[ "$v" = "$VERSION" ] || dkms remove -m $NAME -v "$v" --all >/dev/null 2>&1 || true
+	done
+	dkms add -m $NAME -v $VERSION >/dev/null 2>&1 || true
+	if dkms build -m $NAME -v $VERSION && dkms install -m $NAME -v $VERSION --force; then
+		:
+	else
+		echo "snd-pulsar: DKMS build failed (are the kernel headers for $(uname -r) installed?)" >&2
+	fi
+	mkdir -p /var/lib/snd-pulsar/dsp
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	udevadm control --reload >/dev/null 2>&1 || true
+	if [ ! -f /var/lib/snd-pulsar/dsp/puls2os0.21k ]; then
+		echo
+		echo "snd-pulsar: import the Sonic Core DSP files once (they are not redistributable):"
+		echo "    sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe"
+		echo
+	fi
+	echo "snd-pulsar: reboot (or reload the snd-pulsar module) to start the card with this version."
+fi
+exit 0

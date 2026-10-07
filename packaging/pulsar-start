@@ -1,8 +1,13 @@
 #!/bin/sh
 # Boot the Pulsar II and keep running as the DSP daemon (pulsard), started by snd-pulsar@.service as root.
-# pulsard restores the saved mixer levels itself once the card (and its controls) are up.
+# pulsard restores the saved mixer levels and the last rack itself once the card is up.
 set -e
 : "${PULSAR_DSP_DIR:=/var/lib/snd-pulsar/dsp}"
 export PULSAR_DSP_DIR
+if [ ! -f "$PULSAR_DSP_DIR/puls2os0.21k" ]; then
+	echo "Pulsar II: no SCOPE DSP files in $PULSAR_DSP_DIR." >&2
+	echo "Import them once with: sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe" >&2
+	exit 1
+fi
 # shellcheck disable=SC2086
 exec python3 -I /usr/lib/snd-pulsar/tools/pulsard.py --resource "$1" --dsp-dir "$PULSAR_DSP_DIR" $PULSAR_ARGS

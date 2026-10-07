@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	udevadm control --reload >/dev/null 2>&1 || true
+	rm -rf /var/cache/pulsard
+fi
+if [ "$1" = "purge" ]; then
+	rm -rf /var/lib/snd-pulsar
+fi
+exit 0

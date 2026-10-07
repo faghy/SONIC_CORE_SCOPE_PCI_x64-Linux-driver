@@ -22,7 +22,8 @@ Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `
 | Servizio `pulsard`: moduli DSP caricati e collegati a scheda accesa (`pulsarctl`) | **funziona** |
 | App grafica "Pulsar Scope" (Qt): libreria moduli, trascina e rilascia, cavi, cursori degli ingressi | **funziona** (prima versione) |
 | Progetti: salva/apri (`.pulsar`), banco ripristinato da solo dopo un riavvio | **funziona** |
-| Pacchetto `.deb`, dispositivi SCOPE (`.dev`), ADAT/S/PDIF/MIDI, verifica JACK/Ardour | da fare |
+| Pacchetto `.deb` (driver DKMS, servizio, strumenti, app) | **funziona** |
+| Dispositivi SCOPE (`.dev`), ADAT/S/PDIF/MIDI, verifica JACK/Ardour | da fare |
 
 ## Architettura
 
@@ -51,7 +52,18 @@ innoextract -d ../scope_full SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe
 ```
 In alternativa puoi indicare la cartella `App/Dsp` con la variabile `PULSAR_DSP_DIR`.
 
-## Installazione (avvio automatico)
+## Installazione dal pacchetto .deb (Debian / Ubuntu)
+
+Scarica `snd-pulsar_<versione>_all.deb` dalla pagina [Releases](https://github.com/faghy/SONIC_CORE_SCOPE_PCI_x64-Linux-driver/releases), poi:
+```bash
+sudo apt install ./snd-pulsar_0.2.0_all.deb                          # driver (DKMS), servizio, strumenti, Pulsar Scope
+sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe      # una volta: i file DSP di Sonic Core
+```
+Riavvia (o ricarica il modulo) e la scheda parte da sola. Si rimuove con `sudo apt remove snd-pulsar`
+(`purge` cancella anche i file DSP importati e il banco salvato). Il pacchetto si costruisce con
+`packaging/build-deb.sh`.
+
+## Installazione dai sorgenti (avvio automatico)
 
 ```bash
 sudo ./install.sh --dsp-from ../scope_full/app/App/Dsp     # oppure --dsp-from SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe

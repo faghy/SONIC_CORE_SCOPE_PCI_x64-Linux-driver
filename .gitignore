@@ -7,3 +7,4 @@ modules.order
 Module.symvers
 __pycache__/
 *.pyc
+dist/

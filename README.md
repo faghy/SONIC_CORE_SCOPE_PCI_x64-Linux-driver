@@ -23,7 +23,8 @@ SHARC ADSP-21065L). It was written by reverse engineering the Windows SCOPE 5.1 
 | `pulsard` daemon: DSP modules loaded and wired while the card runs (`pulsarctl`) | **working** |
 | "Pulsar Scope" GUI (Qt): module library, drag & drop, cables, input sliders | **working** (first version) |
 | Projects: save/open (`.pulsar`), rack restored automatically after a reboot | **working** |
-| `.deb` package, SCOPE devices (`.dev`), ADAT/S/PDIF/MIDI, JACK/Ardour check | to do |
+| `.deb` package (DKMS driver, service, tools, GUI) | **working** |
+| SCOPE devices (`.dev`), ADAT/S/PDIF/MIDI, JACK/Ardour check | to do |
 
 ## Architecture
 
@@ -54,7 +55,18 @@ innoextract -d ../scope_full SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe
 ```
 Alternatively, point the `PULSAR_DSP_DIR` variable to its `App/Dsp` folder.
 
-## Installation (automatic start-up)
+## Installation from the .deb package (Debian / Ubuntu)
+
+Download `snd-pulsar_<version>_all.deb` from the [Releases](https://github.com/faghy/SONIC_CORE_SCOPE_PCI_x64-Linux-driver/releases) page, then:
+```bash
+sudo apt install ./snd-pulsar_0.2.0_all.deb                          # driver (DKMS), service, tools, Pulsar Scope
+sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe      # once: the Sonic Core DSP files
+```
+Reboot (or reload the module): the card starts by itself. Remove with `sudo apt remove snd-pulsar`
+(`purge` also deletes the imported DSP files and the saved rack). Build the package yourself with
+`packaging/build-deb.sh`.
+
+## Installation from source (automatic start-up)
 
 ```bash
 sudo ./install.sh --dsp-from ../scope_full/app/App/Dsp     # or --dsp-from SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe

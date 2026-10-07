@@ -197,4 +197,9 @@ sudo rmmod snd-pulsar
    modules, wires that differ from the default graph, removed default wires, values, gui.layout; ids are remapped on load.
    Autosave of the rack to /var/lib/snd-pulsar/current-project.json after every change, restored when pulsard starts.
    `set` on base (fixed) nodes is refused: their gains belong to the ALSA mixer. GUI: File menu New/Open/Save/Save as.
+4g. **.deb package 0.2.0 (2026-10-08), INSTALLED on this PC via apt (replaces install.sh).** `packaging/build-deb.sh` ->
+   dist/snd-pulsar_<VERSION>_all.deb: DKMS source in /usr/src, unit in /usr/lib/systemd/system, udev rule in
+   /usr/lib/udev/rules.d, conffile /etc/default/snd-pulsar, /usr/bin/pulsar-scope + pulsarctl, /usr/sbin/pulsar-import-dsp
+   (DSP files from the SCOPE installer .exe via innoextract or a folder). Bump packaging/VERSION for every release.
+   To update this PC: build the deb, `sudo apt install ./dist/...deb`, then stop wireplumber, rmmod/modprobe snd_pulsar.
 5. **Next:** ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), JACK/Ardour check, .deb package, then the SCOPE-like config app.
