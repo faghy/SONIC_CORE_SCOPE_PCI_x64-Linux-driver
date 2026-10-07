@@ -1,1 +1,0 @@
-savedcmd_/home/faghy/puksar2/linux-driver/snd-pulsar.mod := printf '%s\n'   pulsar_core.o pulsar_pcm.o | awk '!x[$$0]++ { print("/home/faghy/puksar2/linux-driver/"$$0) }' > /home/faghy/puksar2/linux-driver/snd-pulsar.mod

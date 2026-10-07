@@ -1,57 +1,55 @@
-# Driver Linux ALSA per Creamware / Sonic Core Pulsar 2 (snd-pulsar)
+# Driver Linux per Creamware / Sonic Core Pulsar II (snd-pulsar)
 
-Questo progetto contiene il driver kernel Linux nativo per le schede audio DSP **Creamware / Sonic Core Pulsar II e SCOPE**, sviluppato tramite reverse engineering del driver Windows x64 originale (`scScope.sys`).
+Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `14b5:0600`, 6× SHARC ADSP-21065L).
+È sviluppato tramite reverse engineering del software Windows SCOPE 5.1: il driver kernel `scScope.sys` e la libreria `Sim2k.dll`.
 
----
+## Stato
 
-## 1. Architettura Hardware e Registri Identificati
+| Funzione | Stato |
+|---|---|
+| Rilevamento PCI, mappatura BAR0, IRQ | funziona |
+| Avvio dei 6 DSP (caricamento OS `puls2os*.21k`) | **funziona**: ogni DSP risponde |
+| Clock audio interno 44,1 kHz | **funziona** (verificato: 44.095 campioni/s) |
+| 48 kHz, clock esterno | implementato, non ancora testato |
+| Caricamento moduli DSP (I/O analogico, routing) | da fare |
+| Streaming audio PC ↔ scheda (ALSA PCM, JACK/PipeWire, Ardour) | da fare |
 
-Dall'analisi del driver Windows 64-bit e dall'hardware rilevato sul sistema:
+## Architettura
 
-* **PCI Vendor ID:** `0x14B5` (Creamware GmbH)
-* **PCI Device ID:** `0x0600` (Pulsar 2)
-* **Spazio MMIO (BAR 0):** Finestra non-prefetchable a 32-bit di **4 MB** all'indirizzo fisico `0xf7800000`.
-* **Registro di Stato / Revisione Hardware (Offset `0x000000`):**
-  * `u32 raw_id = readl(iobase + 0x00);`
-  * `u8 board_rev = (raw_id >> 8) & 0x1f;`
-* **Finestra FIFO / Mailbox DSP (Offset `0x080000`):**
-  * Finestra a 512 KB per lo scambio messaggi con l'array dei 6 DSP SHARC (ADSP-21065L).
-* **Protocollo Pacchetti Comandi DSP:**
-  * `Header = (cmd << 26) | (len << 22) | 0x000a0000 | (addr & 0x1ffff)`
+Come su Windows, il driver kernel si limita a esporre l'hardware. L'avvio dei DSP avviene da userspace:
 
----
+- **`snd-pulsar.ko`**: modulo kernel. Rileva la scheda e gestisce l'IRQ. Il device hwdep `/dev/snd/hwC<n>D0` permette `mmap` della BAR0 (4 MB).
+  Il PCM ALSA è un segnaposto disattivato di default (`enable_pcm=1` per abilitarlo).
+- **`tools/pulsar_loader.py`**: reset della scheda, caricamento degli OS dei DSP, avvio e configurazione del clock.
+- **`tools/sc_decode.py`**: decodifica i file DSP di SCOPE (`.21k`/`.dsp`/`.ol`, COFF Analog Devices offuscati).
+- **`tools/sharc_dis.py`**: disassemblatore SHARC (port di `sharc_dasm.cpp` di MAME, BSD-3).
+- **`docs/`**: note di reverse engineering (mappa registri, protocollo dei comandi, sequenza di boot, clock).
 
-## 2. Struttura del Codice Sorgente
+## File DSP (non inclusi)
 
-* `pulsar.h`: Definizioni PCI ID, maschere dei registri MMIO, costanti di timing e strutture dati del driver.
-* `pulsar_core.c`: Modulo PCI Linux (`pci_driver`), mappatura BAR 0, aggancio IRQ e registrazione della scheda nel sottosistema ALSA (`snd_card`).
-* `pulsar_pcm.c`: Interfaccia streaming audio ALSA PCM (Playback & Capture) con allocazione buffer DMA a 32-bit managed.
-* `Makefile`: File di compilazione Kbuild compatibile con kernel Linux 5.x / 6.x.
-
----
-
-## 3. Come Testare il Driver su questo Sistema
-
-Il modulo **`snd-pulsar.ko`** è già stato compilato con successo specificamente per il tuo kernel corrente (`6.12.111+deb13-amd64`).
-
-### Caricamento del modulo:
+I file DSP sono di proprietà di Sonic Core e **non sono distribuiti** in questo repository.
+Servono l'installer ufficiale `SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe` e una licenza valida.
+Estrai l'installer con `innoextract` in una cartella `scope_full` accanto al repository:
 ```bash
-sudo insmod /home/faghy/puksar2/linux-driver/snd-pulsar.ko
+innoextract -d ../scope_full SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe
 ```
+In alternativa puoi indicare la cartella `App/Dsp` con la variabile `PULSAR_DSP_DIR`.
 
-### Verifica del riconoscimento hardware:
-```bash
-dmesg | grep -i pulsar
-```
-Dovresti vedere l'output del driver con il rilevamento del chip MMIO a `0xf7800000` e la revisione hardware della scheda.
+## Compilazione e test
 
-### Verifica della scheda audio in ALSA:
 ```bash
-cat /proc/asound/cards
-aplay -l
+make                                   # usa /lib/modules/$(uname -r)/build
+pkexec tools/pulsar_test.sh boot       # carica il modulo, avvia i DSP, imposta 44,1 kHz
+pkexec tools/pulsar_test.sh clock      # misura il word clock dei DSP
+tools/pulsar_loader.py boot --dry-run  # simulazione senza hardware
 ```
+Altri comandi di `pulsar_test.sh` (tutti richiedono root):
+- `info`: legge registri e stato della scheda;
+- `diag`: diagnostica sullo stato del bus tra i DSP e della SRAM condivisa;
+- `dump`: salva su file i registri e la SRAM della scheda;
+- `peek --dsp N --sym NOME`: legge una variabile dall'OS di un DSP in esecuzione;
+- `clock`: misura il word clock dei DSP.
 
-### Rimozione del modulo:
-```bash
-sudo rmmod snd-pulsar
-```
+## Licenza
+
+GPL-2.0-or-later (driver kernel). `tools/sharc_dis.py` deriva da MAME (BSD-3-Clause).
