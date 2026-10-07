@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Creamware / Sonic Core Pulsar 2 hwdep interface: BAR0 mmap + info ioctl,
+ * used by the userspace DSP loader.
+ */
+
+#include <linux/mm.h>
+#include <linux/uaccess.h>
+#include <sound/core.h>
+#include <sound/hwdep.h>
+
+#include "pulsar.h"
+
+static int pulsar_hwdep_open(struct snd_hwdep *hw, struct file *file)
+{
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+	return 0;
+}
+
+static int pulsar_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
+			      unsigned int cmd, unsigned long arg)
+{
+	struct pulsar_card *chip = hw->private_data;
+	struct pulsar_info info = {};
+
+	switch (cmd) {
+	case PULSAR_IOCTL_GET_INFO:
+		info.board_raw_id = chip->board_raw_id;
+		info.board_rev = chip->board_rev;
+		info.bar_len = chip->iobase_len;
+		info.irq_count = atomic_read(&chip->irq_count);
+		info.last_int_status = READ_ONCE(chip->last_int_status);
+		if (copy_to_user((void __user *)arg, &info, sizeof(info)))
+			return -EFAULT;
+		return 0;
+	default:
+		return -ENOTTY;
+	}
+}
+
+static int pulsar_hwdep_mmap(struct snd_hwdep *hw, struct file *file,
+			     struct vm_area_struct *vma)
+{
+	struct pulsar_card *chip = hw->private_data;
+
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	return vm_iomap_memory(vma, chip->iobase_phys, chip->iobase_len);
+}
+
+int pulsar_hwdep_create(struct pulsar_card *chip)
+{
+	struct snd_hwdep *hw;
+	int err;
+
+	err = snd_hwdep_new(chip->card, "Pulsar DSP", 0, &hw);
+	if (err < 0)
+		return err;
+
+	strscpy(hw->name, "Pulsar2 DSP host port", sizeof(hw->name));
+	hw->private_data = chip;
+	hw->ops.open = pulsar_hwdep_open;
+	hw->ops.ioctl = pulsar_hwdep_ioctl;
+	hw->ops.ioctl_compat = pulsar_hwdep_ioctl;
+	hw->ops.mmap = pulsar_hwdep_mmap;
+	hw->exclusive = 1;
+	chip->hwdep = hw;
+	return 0;
+}
