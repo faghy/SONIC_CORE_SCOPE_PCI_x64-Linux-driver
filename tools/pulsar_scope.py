@@ -20,7 +20,7 @@ import sys
 from PySide6.QtCore import QMimeData, QPointF, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (QAction, QBrush, QColor, QDrag, QFont, QKeySequence, QPainter, QPainterPath,
                            QPalette, QPen)
-from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QDockWidget, QFormLayout,
+from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QDockWidget, QFileDialog, QFormLayout,
                                QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsView, QHBoxLayout,
                                QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QSlider,
                                QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
@@ -501,6 +501,22 @@ class Window(QMainWindow):
         a.triggered.connect(self.refresh)
         self.addAction(a)
 
+        self.project_path, self.dirty = None, False
+        fm = self.menuBar().addMenu("&File")
+        for text, key, slot in (("&New (base configuration)", QKeySequence.New, self.new_project),
+                                ("&Open project…", QKeySequence.Open, self.open_project),
+                                ("&Save project", QKeySequence.Save, self.save_project),
+                                ("Save project &as…", QKeySequence.SaveAs, self.save_project_as),
+                                (None, None, None),
+                                ("&Quit", QKeySequence.Quit, self.close)):
+            if text is None:
+                fm.addSeparator()
+                continue
+            act = fm.addAction(text)
+            act.setShortcut(key)
+            act.triggered.connect(slot)
+        self.update_title()
+
         self.refresh()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -539,7 +555,8 @@ class Window(QMainWindow):
             if n is None:
                 n = NodeItem(self, desc)
                 self.view.scene().addItem(n)
-                pos = self.layout.get(desc["id"]) or self.default_pos(desc, k)
+                pos = (st.get("gui", {}).get("layout", {}).get(desc["id"]) or self.layout.get(desc["id"])
+                       or self.default_pos(desc, k))
                 n.setPos(QPointF(*pos))
                 self.nodes[desc["id"]] = n
             elif n.desc != desc:
@@ -585,21 +602,26 @@ class Window(QMainWindow):
             if w.src.node is node or w.dst.node is node:
                 w.update_path()
         self.layout[node.id] = (node.pos().x(), node.pos().y())
+        if not getattr(self, "_refreshing", False) and node.isUnderMouse():
+            self.mark_dirty()
         self.save_layout_later()
 
     # ---- actions
     def connect_pads(self, out_pad, in_pad):
         if self.call({"cmd": "connect", "src": out_pad.node.id, "out": out_pad.index,
                       "dst": in_pad.node.id, "in": in_pad.index}) is not None:
+            self.mark_dirty()
             self.refresh()
 
     def disconnect_wire(self, w):
         if self.call({"cmd": "disconnect", "dst": w["dst"], "in": w["in"]}) is not None:
+            self.mark_dirty()
             self.refresh()
 
     def remove_node(self, nid):
         if self.call({"cmd": "unload", "id": nid}) is not None:
             self.layout.pop(nid, None)
+            self.mark_dirty()
             self.refresh()
 
     def load_module(self, file, pos):
@@ -607,10 +629,12 @@ class Window(QMainWindow):
         if r is not None:
             self.layout[r["id"]] = (pos.x(), pos.y())
             self.save_layout_later()
+            self.mark_dirty()
             self.refresh()
 
     def set_value(self, nid, idx, v):
         if self.call({"cmd": "set", "id": nid, "in": idx, "value": v}) is not None:
+            self.mark_dirty()
             self.refresh()
 
     def edit_values(self, node):
@@ -690,9 +714,103 @@ class Window(QMainWindow):
         self._save_timer.start(1000)
 
     def save_layout(self):
+        layout = {nid: (n.pos().x(), n.pos().y()) for nid, n in self.nodes.items()}
+        self.layout.update(layout)
+        try:
+            request({"cmd": "set_gui", "gui": {"layout": layout}})     # kept with the rack and in projects
+        except DaemonError:
+            pass
         os.makedirs(os.path.dirname(LAYOUT_FILE), exist_ok=True)
         with open(LAYOUT_FILE, "w") as f:
             json.dump(self.layout, f)
+
+    # ---- projects
+    def update_title(self):
+        name = os.path.basename(self.project_path) if self.project_path else "untitled"
+        self.setWindowTitle("%s%s - Pulsar Scope" % ("*" if self.dirty else "", name))
+
+    def mark_dirty(self):
+        self.dirty = True
+        self.update_title()
+
+    def confirm_discard(self):
+        if not self.dirty:
+            return True
+        r = QMessageBox.question(self, "Pulsar Scope", "The current rack has unsaved changes. Discard them?",
+                                 QMessageBox.Discard | QMessageBox.Cancel)
+        return r == QMessageBox.Discard
+
+    def clear_rack(self):
+        for n in list(self.nodes.values()):
+            self.view.scene().removeItem(n)
+        self.nodes.clear()
+        self.layout = {}
+
+    def new_project(self):
+        if not self.confirm_discard():
+            return
+        if self.call({"cmd": "reset"}) is None:
+            return
+        self.clear_rack()
+        self.project_path, self.dirty = None, False
+        self.update_title()
+        self.refresh()
+
+    def open_project(self):
+        if not self.confirm_discard():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Open project", os.path.expanduser("~"),
+                                              "Pulsar projects (*.pulsar);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                prj = json.load(f)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Pulsar Scope", "Cannot read %s: %s" % (path, e))
+            return
+        r = self.call({"cmd": "load_project", "project": prj})
+        if r is None:
+            return
+        self.clear_rack()
+        self.project_path, self.dirty = path, False
+        self.update_title()
+        self.refresh()
+        if r.get("errors"):
+            QMessageBox.warning(self, "Pulsar Scope", "Project loaded with problems:\n\n" + "\n".join(r["errors"]))
+
+    def save_project(self):
+        if not self.project_path:
+            return self.save_project_as()
+        self.save_layout()
+        r = self.call({"cmd": "save_project"})
+        if r is None:
+            return False
+        try:
+            with open(self.project_path, "w") as f:
+                json.dump(r["project"], f, indent=1)
+        except OSError as e:
+            QMessageBox.warning(self, "Pulsar Scope", "Cannot save %s: %s" % (self.project_path, e))
+            return False
+        self.dirty = False
+        self.update_title()
+        return True
+
+    def save_project_as(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save project", self.project_path or os.path.expanduser("~/untitled.pulsar"),
+                                              "Pulsar projects (*.pulsar)")
+        if not path:
+            return False
+        if not path.endswith(".pulsar"):
+            path += ".pulsar"
+        self.project_path = path
+        return self.save_project()
+
+    def closeEvent(self, e):
+        if self.confirm_discard():
+            e.accept()
+        else:
+            e.ignore()
 
 
 def dark_palette(app):

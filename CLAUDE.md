@@ -193,4 +193,8 @@ sudo rmmod snd-pulsar
    (handled in RackView.mousePressEvent: NO grabMouse, it froze the app), Delete/right-click removes, double-click opens
    input sliders (0..max of the pad; Apply sends only moved sliders). Layout in ~/.config/pulsar-scope/layout.json.
    Verified by the user: sine -> LINVOL -> Mix L/R audible on both channels.
+4f. **Projects (2026-10-08).** pulsard: save_project / load_project / reset / set_gui; project = JSON (.pulsar) with added
+   modules, wires that differ from the default graph, removed default wires, values, gui.layout; ids are remapped on load.
+   Autosave of the rack to /var/lib/snd-pulsar/current-project.json after every change, restored when pulsard starts.
+   `set` on base (fixed) nodes is refused: their gains belong to the ALSA mixer. GUI: File menu New/Open/Save/Save as.
 5. **Next:** ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), JACK/Ardour check, .deb package, then the SCOPE-like config app.

@@ -16,6 +16,12 @@ line in each direction. Requests: {"cmd": NAME, ...}; replies: {"ok": true, ...}
   connect src out dst in                  wire output `out` of src to input `in` of dst
   disconnect dst in                       input back to silence
   set id in value                         feed an input with a constant (raw 32-bit, e.g. 1.31 gain)
+  save_project                            the current rack as a project (modules, changed wires, values, gui)
+  load_project project                    reset, then rebuild the rack from a project; returns id map + errors
+  reset                                   back to the base configuration
+  set_gui gui                             store GUI data (layout) with the rack
+
+The rack is autosaved to /var/lib/snd-pulsar/current-project.json after every change and restored at start.
 
 Outputs are numbered async outputs first, then sync outputs (as the DSP module itself numbers them).
 Node "pc_play" is the audio coming from the PC (ALSA playback, 2 sync outputs); "pc_rec" is the audio going
@@ -111,6 +117,9 @@ class Graph:
             else:
                 self.wires[(ano, ch)] = (pc, 0)
             self.wires[("pc_rec", ch)] = (ani, ch)
+        self.default_wires = dict(self.wires)
+        self.gui = {}                                        # opaque GUI data (layout), kept in projects
+        self.state_file = None                               # autosave target (set by main)
 
     # ---- bookkeeping
     def add_node(self, kind, title, mod=None, dsp=None, fixed=False, nid=None):
@@ -143,7 +152,8 @@ class Graph:
         return {"rate": self.rate, "dsps": self.dsp_load(),
                 "nodes": [n.describe() for n in self.nodes.values()],
                 "wires": [{"src": s, "out": o, "dst": d, "in": i} for (d, i), (s, o) in self.wires.items()],
-                "values": [{"id": n, "in": i, "value": v} for (n, i), v in self.values.items()]}
+                "values": [{"id": n, "in": i, "value": v} for (n, i), v in self.values.items()],
+                "gui": self.gui}
 
     def catalog(self, refresh=False):
         if self._catalog is not None and not refresh:
@@ -243,6 +253,8 @@ class Graph:
         n = self.node(nid)
         if n.kind != "module":
             raise GraphError("%s has no settable inputs" % nid)
+        if n.fixed:
+            raise GraphError("%s is part of the base configuration (levels are in the ALSA mixer)" % nid)
         self.execute(self.rack.set_in_pad(n.mod, inp, int(value) & 0xFFFFFFFF))
         self.wires.pop((nid, inp), None)
         self.values[(nid, inp)] = int(value) & 0xFFFFFFFF
@@ -261,6 +273,71 @@ class Graph:
         for k in [k for k in self.values if k[0] == nid]:
             self.values.pop(k)
         del self.nodes[nid]
+
+
+    # ---- projects
+    def export_project(self):
+        mods = [{"id": n.id, "file": n.mod.cls.name, "dsp": n.dsp, "title": n.title}
+                for n in self.nodes.values() if n.kind == "module" and not n.fixed]
+        wires = [{"src": s, "out": o, "dst": d, "in": i} for (d, i), (s, o) in self.wires.items()
+                 if self.default_wires.get((d, i)) != (s, o)]
+        removed = [{"dst": d, "in": i} for (d, i) in self.default_wires if (d, i) not in self.wires]
+        values = [{"id": n, "in": i, "value": v} for (n, i), v in self.values.items()]
+        return {"format": "pulsar-project", "version": 1, "rate": self.rate, "modules": mods,
+                "wires": wires, "removed": removed, "values": values, "gui": self.gui}
+
+    def reset(self):
+        """Back to the base configuration: unload every added module, restore the default wiring."""
+        for nid in [n.id for n in self.nodes.values() if not n.fixed]:
+            self.unload(nid)
+        for (d, i), (src, out) in self.default_wires.items():
+            if self.wires.get((d, i)) != (src, out) and d != "pc_rec":
+                self.connect(src, out, d, i)
+        self.gui = {}
+
+    def import_project(self, prj):
+        if prj.get("format") != "pulsar-project":
+            raise GraphError("not a Pulsar project")
+        self.reset()
+        ids, errors = {}, []
+        for m in prj.get("modules", []):
+            try:
+                ids[m["id"]] = self.load(m["file"], m.get("dsp"), m.get("title"))
+            except Exception as e:                           # keep going: report what could not be restored
+                errors.append("module %s (%s): %s" % (m.get("title"), m.get("file"), e))
+        mapped = lambda nid: ids.get(nid, nid)
+        for r in prj.get("removed", []):
+            try:
+                self.disconnect(mapped(r["dst"]), int(r["in"]))
+            except Exception as e:
+                errors.append("disconnect %s.%s: %s" % (r.get("dst"), r.get("in"), e))
+        for w in prj.get("wires", []):
+            try:
+                self.connect(mapped(w["src"]), int(w["out"]), mapped(w["dst"]), int(w["in"]))
+            except Exception as e:
+                errors.append("wire %s.%s -> %s.%s: %s" % (w.get("src"), w.get("out"), w.get("dst"), w.get("in"), e))
+        for v in prj.get("values", []):
+            try:
+                self.set_value(mapped(v["id"]), int(v["in"]), int(v["value"]))
+            except Exception as e:
+                errors.append("value %s.%s: %s" % (v.get("id"), v.get("in"), e))
+        gui = prj.get("gui") or {}
+        self.gui = dict(gui, layout={mapped(k): v for k, v in (gui.get("layout") or {}).items()})
+        return {"ids": ids, "errors": errors}
+
+    def autosave(self):
+        if not self.state_file:
+            return
+        tmp = self.state_file + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(self.export_project(), f)
+            os.replace(tmp, self.state_file)
+        except OSError:
+            pass
+
+
+MUTATING = {"load", "unload", "connect", "disconnect", "set", "reset", "load_project", "set_gui"}
 
 
 class Handler(socketserver.StreamRequestHandler):
@@ -289,8 +366,20 @@ class Handler(socketserver.StreamRequestHandler):
                     elif cmd == "set":
                         g.set_value(req["id"], int(req["in"]), int(req["value"]))
                         res = {}
+                    elif cmd == "save_project":
+                        res = {"project": g.export_project()}
+                    elif cmd == "load_project":
+                        res = g.import_project(req["project"])
+                    elif cmd == "reset":
+                        g.reset()
+                        res = {}
+                    elif cmd == "set_gui":
+                        g.gui = req.get("gui") or {}
+                        res = {}
                     else:
                         raise GraphError("unknown command %r" % cmd)
+                    if cmd in MUTATING:
+                        g.autosave()
                 res["ok"] = True
             except (GraphError, pm.LinkError, pl.LoaderError, KeyError, ValueError, OSError) as e:
                 res = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
@@ -322,6 +411,9 @@ def main():
     ap.add_argument("--volume", type=float, default=-30.0)
     ap.add_argument("--monitor", type=float, default=-12.0)
     ap.add_argument("--no-monitor", action="store_true")
+    ap.add_argument("--state", default=None,
+                    help="autosave of the current rack, restored at start ('' disables; default "
+                         "/var/lib/snd-pulsar/current-project.json, none with --dry-run)")
     ap.add_argument("--dry-run", action="store_true", help="simulated card (development)")
     ap.add_argument("--log", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -338,6 +430,18 @@ def main():
         print("pulsard: card boot failed", file=sys.stderr)
         return 1
     graph = Graph(b, a.dsp_dir, a.rate, handles)
+    if a.state is None:
+        a.state = "" if a.dry_run else "/var/lib/snd-pulsar/current-project.json"
+    if a.state:
+        graph.state_file = a.state
+        if os.path.exists(a.state):
+            try:
+                with open(a.state) as f:
+                    r = graph.import_project(json.load(f))
+                print("pulsard: restored previous session (%d modules%s)" %
+                      (len(r["ids"]), ", errors: " + "; ".join(r["errors"]) if r["errors"] else ""), flush=True)
+            except (OSError, ValueError, GraphError) as e:
+                print("pulsard: could not restore previous session: %s" % e, flush=True)
     if not a.dry_run:
         subprocess.run(["alsactl", "restore", "Pulsar2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
