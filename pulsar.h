@@ -59,13 +59,38 @@
 #define PULSAR_INT_PENDING_MASK        0x00000003
 #define PULSAR_INT_INVALID_MASK        0xffff0000
 
+/* Host<->DSP audio slots (docs/pcm_streaming.md 2) */
+#define PULSAR_SLOT_A(s)               (0x080000 + 4 * (s))   /* slot table bank A */
+#define PULSAR_SLOT_B(s)               (0x080800 + 4 * (s))   /* slot table bank B */
+#define PULSAR_SLOT_WIN(s)             (0x080000 + 0x200 * (s)) /* per-slot prefetch window */
+#define PULSAR_SLOT_IDLE               0x800
+#define PULSAR_SLOT_CAPTURE            0x1
+#define PULSAR_SLOT_FIRST              0x10
+#define PULSAR_SLOT_PC_FIRST           0x180
+#define PULSAR_SLOT_MAX                0x1ff
+#define PULSAR_RING_FRAMES             0x1000                  /* 16 KB ring per channel */
+#define PULSAR_RING_BYTES              (PULSAR_RING_FRAMES * 4)
+#define PULSAR_COUNTER_MASK            (PULSAR_RING_FRAMES - 1)
+
+struct pulsar_stream {
+	struct snd_pcm_substream *substream;
+	const u16 *slots;
+	unsigned int channels;
+	bool armed;                       /* enable slots at the next ring wrap */
+	bool running;                     /* slots live, periods are being reported */
+	bool live;                        /* slot entries point at our ring */
+};
+
 struct pulsar_card {
 	struct pci_dev *pci;
 	struct snd_card *card;
 	struct snd_pcm *pcm;
 	struct snd_hwdep *hwdep;
-	struct snd_pcm_substream *playback_substream;
-	struct snd_pcm_substream *capture_substream;
+	struct pulsar_stream playback;
+	struct pulsar_stream capture;
+	struct pulsar_pcm_route route;
+	bool route_valid;
+	struct mutex route_mutex;
 
 	void __iomem *iobase;
 	resource_size_t iobase_phys;
@@ -79,12 +104,12 @@ struct pulsar_card {
 	atomic_t irq_count;
 	u32 last_int_status;
 
-	atomic_t current_period;
 	spinlock_t reg_lock;
 };
 
-int pulsar_pcm_create(struct pulsar_card *chip);
-void pulsar_pcm_period_elapsed(struct pulsar_card *chip);
+int pulsar_pcm_set_route(struct pulsar_card *chip, const struct pulsar_pcm_route *r);
+void pulsar_pcm_interrupt(struct pulsar_card *chip);
+void pulsar_pcm_quiesce(struct pulsar_card *chip);
 int pulsar_hwdep_create(struct pulsar_card *chip);
 
 #endif /* _PULSAR_H_ */

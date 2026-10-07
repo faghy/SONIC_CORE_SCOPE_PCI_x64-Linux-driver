@@ -780,6 +780,43 @@ def play_tone(b, dsp_dir, freq, rate, volume_db=-30.0):
           % (freq, volume_db))
 
 
+PLAY_SLOTS = (0x180, 0x181)          # PC playback slots -> DSP DM 0xC300 / 0xC302 (docs/pcm_streaming.md 3.1)
+
+
+def set_route(bar, rate, block, play_slots=(), cap_slots=()):
+    """PULSAR_IOCTL_SET_ROUTE: tell snd-pulsar which slots carry which ALSA channel."""
+    import fcntl
+    ps = list(play_slots) + [0] * (8 - len(play_slots))
+    cs = list(cap_slots) + [0] * (8 - len(cap_slots))
+    buf = struct.pack("<II8H8HIII", rate, block, *ps, *cs, len(play_slots), len(cap_slots), 0)
+    req = (1 << 30) | (len(buf) << 16) | (ord("P") << 8) | 0x02   # _IOW('P', 2, struct pulsar_pcm_route)
+    if isinstance(bar, Bar):
+        fcntl.ioctl(bar.fd, req, buf)
+
+
+def setup_pcm(b, dsp_dir, rate, volume_db=-30.0, block=1024):
+    """Playback graph: PC slots 0x180/0x181 -> LINVOL L/R (safety gain) -> P2_ANO on DSP1, then SET_ROUTE."""
+    import pulsar_modules as pm
+    rack = pm.Rack(dsp_dir)
+    _, ops = rack.load(os.path.join(dsp_dir, "P2_AINIT.dsp"), 0)
+    ano, o = rack.load(os.path.join(dsp_dir, "P2_ANO.dsp"), 1)
+    ops += o
+    gain = min(0x7FFFFFFF, int(round(10 ** (volume_db / 20.0) * 0x7FFFFFFF)))
+    for ch, slot in enumerate(PLAY_SLOTS):
+        vol, o = rack.load(os.path.join(dsp_dir, "LINVOL.dsp"), 1)
+        ops += o
+        ops += rack.dsp[1].link_input(vol, 0, 0xC000 + 2 * slot)       # signal <- PC slot
+        ops += rack.set_in_pad(vol, 1, gain)
+        ops += rack.connect(vol, 0, ano, ch)
+    if b.verbose:
+        print(pm.format_ops(ops))
+    pm.execute(b, ops)
+    b.plate_set(RATE_BITS.get(rate, 0x4))                              # un-mute analog outs
+    set_route(b.bar, rate, block, PLAY_SLOTS)
+    print("  PCM route set: playback slots %s -> LINVOL %.1f dB -> analog out 1/2"
+          % (", ".join("0x%x" % s for s in PLAY_SLOTS), volume_db))
+
+
 def cmd_plate(args):
     """Rewrite the backplate audio-cfg word (PPlate, 11 bits) on a running card, then read the status.
     0x404 = 44.1 kHz internal, analog outputs live; 0x484 = same with bit 0x80 = analog outputs muted."""
@@ -789,6 +826,47 @@ def cmd_plate(args):
     b.write_audio_cfg(args.cfg)
     st = b.read_audio_cfg()
     print("readAudioCfg = 0x%04x%s%s" % (st, " lock(0x4)" if st & 4 else "", " HAVARIE(0x100)" if st & 0x100 else ""))
+
+
+def hwdep_info(bar):
+    """PULSAR_IOCTL_GET_INFO on the hwdep device (pulsar_uapi.h): raw_id, rev, bar_len, irq_count, last_status."""
+    import fcntl
+    if not isinstance(bar, Bar) or not bar.path.startswith("/dev/snd/"):
+        return None
+    buf = bytearray(32)
+    req = (2 << 30) | (32 << 16) | (ord("P") << 8) | 0x01      # _IOR('P', 1, struct pulsar_info)
+    fcntl.ioctl(bar.fd, req, buf)
+    return struct.unpack("<8I", buf)
+
+
+def cmd_counter(args):
+    """Sample BAR+0x10 every 5 ms for 1 s (unwrapping), and measure the IRQ rate via the hwdep ioctl."""
+    bar = open_bar(args)
+    info0 = hwdep_info(bar)
+    t0 = time.monotonic()
+    samples = [(t0, bar.rd(4))]
+    while time.monotonic() - t0 < 1.0:
+        time.sleep(0.005)
+        samples.append((time.monotonic(), bar.rd(4)))
+    info1 = hwdep_info(bar)
+    dt = samples[-1][0] - samples[0][0]
+    total, wraps, maxv = 0, [], 0
+    for (ta, a), (tb, b_) in zip(samples, samples[1:]):
+        maxv = max(maxv, a, b_)
+        if b_ >= a:
+            total += b_ - a
+        else:
+            wraps.append(a)
+    # unwrap with the observed modulus: next power of two above the max value seen
+    mod = 1 << maxv.bit_length()
+    total = sum(((b_ - a) % mod) for (_, a), (_, b_) in zip(samples, samples[1:]))
+    steps = [((b_ - a) % mod) for (_, a), (_, b_) in zip(samples, samples[1:])]
+    print("BAR+0x10   : %d samples in %.3f s, max value 0x%x -> modulus 0x%x, %d wraps"
+          % (len(samples), dt, maxv, mod, len(wraps)))
+    print("rate       : %.1f counts/s (step per 5 ms: min %d, max %d)" % (total / dt, min(steps), max(steps)))
+    if info0 and info1:
+        print("IRQ        : %d in %.3f s = %.2f /s, last status 0x%08x"
+              % (info1[3] - info0[3], dt, (info1[3] - info0[3]) / dt, info1[4]))
 
 
 def cmd_boot(args):
@@ -820,7 +898,12 @@ def cmd_boot(args):
         b.finish_run(irq=args.irq, rate=44100)
         if args.rate != 44100 or args.clock != "internal":
             b.set_rate(args.rate, args.clock)
-        if args.tone:
+        if args.pcm:
+            if not (args.irq and args.bus_master):
+                raise LoaderError("--pcm needs --irq and --bus-master")
+            print("[pcm] playback graph + ALSA route")
+            setup_pcm(b, args.dsp_dir, args.rate, args.volume)
+        elif args.tone:
             print("[tone] sine %g Hz, %.1f dB -> P-Plate analog out 1/2" % (args.tone, args.volume))
             play_tone(b, args.dsp_dir, args.tone, args.rate, args.volume)
     print("FIFO wr=0x%x rd=0x%x, reg0=0x%08x" % (b.fifo_wr, bar.rd(2) & 0x3FF, bar.rd(0)))
@@ -831,7 +914,7 @@ def cmd_boot(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=("info", "diag", "dump", "peek", "clock", "plate", "boot"))
+    ap.add_argument("command", choices=("info", "diag", "dump", "peek", "clock", "plate", "counter", "boot"))
     ap.add_argument("--resource", help="mmap this file instead of the hwdep device "
                                        "(e.g. /sys/bus/pci/devices/0000:06:01.0/resource0)")
     ap.add_argument("--dsp-dir", default=DEFAULT_DSP_DIR)
@@ -845,6 +928,7 @@ def main():
     ap.add_argument("--rate", type=int, default=44100, choices=(32000, 44100, 48000))
     ap.add_argument("--clock", default="internal", choices=("internal", "external"))
     ap.add_argument("--volume", type=float, default=-30.0, help="tone level in dBFS (default -30)")
+    ap.add_argument("--pcm", action="store_true", help="after boot, build the PC playback graph and set the ALSA route")
     ap.add_argument("--tone", type=float, help="after boot, play a full-scale sine of this frequency on analog out 1/2")
     ap.add_argument("--irq", action="store_true", help="reg1 = 0x11 (block IRQ); needs the snd-pulsar ISR")
     ap.add_argument("--no-finish", action="store_true", help="stop after the dspID round-trip")
@@ -856,7 +940,7 @@ def main():
     if args.dry_run and not args.log:
         args.log = "bar_writes.log"
     try:
-        return {"info": cmd_info, "diag": cmd_diag, "dump": cmd_dump, "peek": cmd_peek, "clock": cmd_clock, "plate": cmd_plate, "boot": cmd_boot}[args.command](args) or 0
+        return {"info": cmd_info, "diag": cmd_diag, "dump": cmd_dump, "peek": cmd_peek, "clock": cmd_clock, "plate": cmd_plate, "counter": cmd_counter, "boot": cmd_boot}[args.command](args) or 0
     except LoaderError as e:
         print("error: %s" % e, file=sys.stderr)
         return 1

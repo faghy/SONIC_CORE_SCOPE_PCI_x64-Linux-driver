@@ -22,7 +22,6 @@ MODULE_LICENSE("GPL");
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
-static bool enable_pcm;
 
 module_param_array(index, int, NULL, 0444);
 MODULE_PARM_DESC(index, "Index value for Creamware Pulsar/Scope soundcard.");
@@ -30,8 +29,6 @@ module_param_array(id, charp, NULL, 0444);
 MODULE_PARM_DESC(id, "ID string for Creamware Pulsar/Scope soundcard.");
 module_param_array(enable, bool, NULL, 0444);
 MODULE_PARM_DESC(enable, "Enable Creamware Pulsar/Scope soundcard.");
-module_param(enable_pcm, bool, 0444);
-MODULE_PARM_DESC(enable_pcm, "Register the (not yet functional) PCM device. Default off, so desktop audio is not routed to a silent sink.");
 
 static const struct pci_device_id snd_pulsar_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_CREAMWARE, PCI_DEVICE_ID_SCOPE_SP) },
@@ -66,7 +63,7 @@ static irqreturn_t snd_pulsar_interrupt(int irq, void *dev_id)
 	atomic_inc(&chip->irq_count);
 
 	if (chip->pcm)
-		pulsar_pcm_period_elapsed(chip);
+		pulsar_pcm_interrupt(chip);
 
 	return IRQ_HANDLED;
 }
@@ -96,6 +93,7 @@ static int __snd_pulsar_probe(struct pci_dev *pci, const struct pci_device_id *p
 	chip->pci = pci;
 	chip->irq = -1;
 	spin_lock_init(&chip->reg_lock);
+	mutex_init(&chip->route_mutex);
 
 	err = pcim_enable_device(pci);
 	if (err < 0)
@@ -137,11 +135,7 @@ static int __snd_pulsar_probe(struct pci_dev *pci, const struct pci_device_id *p
 	if (err < 0)
 		return err;
 
-	if (enable_pcm) {
-		err = pulsar_pcm_create(chip);
-		if (err < 0)
-			return err;
-	}
+	/* the PCM device is created by PULSAR_IOCTL_SET_ROUTE once the DSP graph is loaded */
 
 	strscpy(card->driver, "Pulsar2", sizeof(card->driver));
 	strscpy(card->shortname, "SonicCore Pulsar2", sizeof(card->shortname));
@@ -163,10 +157,21 @@ static int snd_pulsar_probe(struct pci_dev *pci, const struct pci_device_id *pci
 	return snd_card_free_on_error(&pci->dev, __snd_pulsar_probe(pci, pci_id));
 }
 
+/* runs before devres unmaps BAR0: make sure the engine no longer touches our DMA rings */
+static void snd_pulsar_remove(struct pci_dev *pci)
+{
+	struct snd_card *card = pci_get_drvdata(pci);
+
+	if (card)
+		pulsar_pcm_quiesce(card->private_data);
+}
+
 static struct pci_driver snd_pulsar_driver = {
 	.name = DRV_NAME,
 	.id_table = snd_pulsar_ids,
 	.probe = snd_pulsar_probe,
+	.remove = snd_pulsar_remove,
+	.shutdown = snd_pulsar_remove,
 };
 
 module_pci_driver(snd_pulsar_driver);

@@ -23,8 +23,13 @@ static int pulsar_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 {
 	struct pulsar_card *chip = hw->private_data;
 	struct pulsar_info info = {};
+	struct pulsar_pcm_route route;
 
 	switch (cmd) {
+	case PULSAR_IOCTL_SET_ROUTE:
+		if (copy_from_user(&route, (void __user *)arg, sizeof(route)))
+			return -EFAULT;
+		return pulsar_pcm_set_route(chip, &route);
 	case PULSAR_IOCTL_GET_INFO:
 		info.board_raw_id = chip->board_raw_id;
 		info.board_rev = chip->board_rev;

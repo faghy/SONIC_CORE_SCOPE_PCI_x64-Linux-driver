@@ -156,4 +156,14 @@ sudo rmmod snd-pulsar
    KEY: PPlate cfg bit 0x80 MUTES the analog outputs. Run writes 0x484 (muted), so 0x404 (44.1k) must be written after the
    modules are loaded. `pulsar_test.sh plate --cfg 0x484` mutes again, `--cfg 0x404` un-mutes.
    SAFETY: CSineR4 is full scale (0 dBFS); always go through LINVOL (Out = In*Vol, 1.31 fraction).
-4. **PCM streaming:** host DMA rings + slot table at BAR+0x80000 (scScope_sys.md §audio), position from reg4.
+4. **PCM PLAYBACK: WORKING (2026-10-07).** `pkexec tools/pulsar_test.sh reload boot --bus-master --irq --pcm`:
+   loader builds PC slots 0x180/0x181 (DM 0xC300/0xC302) -> 2x LINVOL (-30 dB safety gain) -> P2_ANO@DSP1, un-mutes
+   (0x404) and calls PULSAR_IOCTL_SET_ROUTE; the kernel then creates the ALSA PCM (zero-copy, non-interleaved S32_LE,
+   4096-frame ring = buffer, period = 1024 = IRQ block, slots enabled at ring wrap, pointer = BAR+0x10 & 0xfff).
+   Verified: speaker-test via plughw:2,0 and pw-play via PipeWire sink "Pulsar2 Stereo", both channels clean.
+   BAR+0x10 is a 1:1 frame counter (15 bit, wraps at 0x8000); IRQ 43/s at block 1024.
+   NOTE: WirePlumber only picks up the PCM if it starts after SET_ROUTE (in tests: `systemctl --user restart
+   wireplumber`); in the final package the loader runs at boot before the user session.
+5. **Next:** capture (P2_ANI -> comm slots, docs/pcm_streaming.md 5.6), ALSA mixer control for LINVOL, 48 kHz test,
+   packaging (DKMS + systemd unit running the loader at boot + script extracting DSP files from the user's installer),
+   then the SCOPE-like config app.

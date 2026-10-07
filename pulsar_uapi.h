@@ -21,7 +21,25 @@ struct pulsar_info {
 	__u32 reserved[3];
 };
 
+/*
+ * Audio route, set by the userspace loader once the DSP graph is loaded (docs/pcm_streaming.md 5.2).
+ * Playback slot s (0x180..0x1ff) feeds DSP DM 0xC000 + 2*s; capture slot s (0x40..0x17f) is the
+ * DSP sync-output comm slot (A - 0xC000) / 2. The ALSA PCM device appears after the first valid route.
+ */
+#define PULSAR_MAX_CHANNELS    8
+
+struct pulsar_pcm_route {
+	__u32 rate;                               /* word clock, e.g. 44100 */
+	__u32 block;                              /* frames per IRQ: 64..1024, power of two */
+	__u16 play_slot[PULSAR_MAX_CHANNELS];
+	__u16 cap_slot[PULSAR_MAX_CHANNELS];
+	__u32 play_channels;
+	__u32 cap_channels;
+	__u32 flags;                              /* reserved, 0 */
+};
+
 #define PULSAR_IOCTL_MAGIC     'P'
 #define PULSAR_IOCTL_GET_INFO  _IOR(PULSAR_IOCTL_MAGIC, 0x01, struct pulsar_info)
+#define PULSAR_IOCTL_SET_ROUTE _IOW(PULSAR_IOCTL_MAGIC, 0x02, struct pulsar_pcm_route)
 
 #endif /* _PULSAR_UAPI_H_ */
