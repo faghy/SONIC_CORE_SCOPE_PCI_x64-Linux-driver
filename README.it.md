@@ -20,7 +20,8 @@ Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `
 | Monitor diretto ingressi → uscite, volumi in `alsamixer` | **funziona**: "DSP Out", "Input Monitor" |
 | Installazione con avvio automatico (DKMS + servizio systemd) | **funziona**: la scheda parte da sola all'accensione |
 | Servizio `pulsard`: moduli DSP caricati e collegati a scheda accesa (`pulsarctl`) | **funziona** |
-| App grafica "Pulsar Scope" (Qt), ADAT/S/PDIF/MIDI, verifica JACK/Ardour | da fare |
+| App grafica "Pulsar Scope" (Qt): libreria moduli, trascina e rilascia, cavi, cursori degli ingressi | **funziona** (prima versione) |
+| Salvataggio progetti, dispositivi SCOPE (`.dev`), ADAT/S/PDIF/MIDI, verifica JACK/Ardour | da fare |
 
 ## Architettura
 
@@ -33,6 +34,8 @@ Come su Windows, il driver kernel si limita a esporre l'hardware. L'avvio dei DS
 - **`tools/pulsar_modules.py`**: linker dei moduli DSP (rilocazione, caricamento, catena di esecuzione, collegamenti).
 - **`tools/scope_dev.py`**: decodifica i file dispositivo di SCOPE (`.io`/`.dev`/`.mdl`/`.pro`).
 - **`tools/pulsard.py`** + **`tools/pulsarctl.py`**: servizio che tiene la scheda dopo l'avvio e accetta comandi (`pulsarctl status`, `load`, `connect`, `set`, `unload`) sul socket `/run/pulsard.sock` (gruppo `audio`).
+- **`tools/pulsar_scope.py`**: app modulare "Pulsar Scope" (Qt/PySide6, qualsiasi desktop): si trascinano i moduli
+  dalla libreria al banco, si collegano le prese con il mouse e si regolano i valori. Si avvia dal menu delle applicazioni.
 - **`tools/sharc_dis.py`**: disassemblatore SHARC (port di `sharc_dasm.cpp` di MAME, BSD-3).
 - **`docs/`**: note di reverse engineering (mappa registri, protocollo dei comandi, sequenza di boot, clock).
 

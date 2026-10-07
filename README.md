@@ -21,7 +21,8 @@ SHARC ADSP-21065L). It was written by reverse engineering the Windows SCOPE 5.1 
 | Direct input → output monitoring, levels in `alsamixer` | **working**: "DSP Out", "Input Monitor" |
 | Installation with automatic start-up (DKMS + systemd service) | **working**: the card starts by itself at boot |
 | `pulsard` daemon: DSP modules loaded and wired while the card runs (`pulsarctl`) | **working** |
-| "Pulsar Scope" GUI (Qt), ADAT/S/PDIF/MIDI, JACK/Ardour check | to do |
+| "Pulsar Scope" GUI (Qt): module library, drag & drop, cables, input sliders | **working** (first version) |
+| Project save/load, SCOPE devices (`.dev`), ADAT/S/PDIF/MIDI, JACK/Ardour check | to do |
 
 ## Architecture
 
@@ -36,6 +37,8 @@ As on Windows, the kernel driver only exposes the hardware; the DSPs are booted 
 - **`tools/scope_dev.py`**: decoder for SCOPE device files (`.io`/`.dev`/`.mdl`/`.pro`).
 - **`tools/pulsard.py`** + **`tools/pulsarctl.py`**: daemon that owns the card after boot and accepts commands
   (`pulsarctl status`, `load`, `connect`, `set`, `unload`) on the `/run/pulsard.sock` socket (group `audio`).
+- **`tools/pulsar_scope.py`**: "Pulsar Scope" modular GUI (Qt/PySide6, any desktop): drag modules from the
+  library onto the rack, wire pads with the mouse, set input values. Started from the applications menu.
 - **`tools/sharc_dis.py`**: SHARC disassembler (port of MAME's `sharc_dasm.cpp`, BSD-3).
 - **`docs/`**: reverse-engineering notes (register map, command protocol, boot sequence, clock, streaming).
 

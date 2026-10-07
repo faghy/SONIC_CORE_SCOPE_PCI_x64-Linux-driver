@@ -46,6 +46,11 @@ class GraphError(Exception):
     pass
 
 
+def _s32(v):
+    v &= 0xFFFFFFFF
+    return v - (1 << 32) if v & 0x80000000 else v
+
+
 class Node:
     def __init__(self, nid, kind, title, mod=None, dsp=None, fixed=False):
         self.id, self.kind, self.title, self.mod, self.dsp, self.fixed = nid, kind, title, mod, dsp, fixed
@@ -55,8 +60,8 @@ class Node:
             return []
         if self.kind == "pc_rec":
             return [{"index": i, "name": n, "sync": True} for i, n in enumerate(("L", "R"))]
-        return [{"index": p.num, "name": p.short, "long": p.long, "sync": p.sync}
-                for p in self.mod.cls.pads if p.kind == "in"]
+        return [{"index": p.num, "name": p.short, "long": p.long, "sync": p.sync, "type": p.type,
+                 "min": _s32(p.min), "max": _s32(p.max)} for p in self.mod.cls.pads if p.kind == "in"]
 
     def outputs(self):
         if self.kind == "pc_play":
@@ -143,7 +148,7 @@ class Graph:
     def catalog(self, refresh=False):
         if self._catalog is not None and not refresh:
             return self._catalog
-        cache = "/var/cache/pulsard/catalog.json"
+        cache = "/var/cache/pulsard/catalog-v2.json"
         if not refresh and os.path.exists(cache):
             try:
                 with open(cache) as f:
@@ -162,7 +167,8 @@ class Graph:
             fixed = (c.flags >> 17) & 0xF
             cat.append({"file": fn, "name": c.short, "long": c.long, "cycles": c.syncCycles,
                         "fixed_dsp": fixed - 1 if fixed else None,
-                        "inputs": [{"name": p.short, "long": p.long, "sync": p.sync} for p in c.pads if p.kind == "in"],
+                        "inputs": [{"name": p.short, "long": p.long, "sync": p.sync, "type": p.type,
+                                    "min": _s32(p.min), "max": _s32(p.max)} for p in c.pads if p.kind == "in"],
                         "outputs": [{"name": p.short, "long": p.long, "sync": p.sync}
                                     for p in c.pads if p.kind != "in"]})
         self._catalog = cat

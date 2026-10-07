@@ -25,7 +25,7 @@ done
 step() { echo; echo "=== $*"; }
 
 step "1/5 build dependencies (dkms, kernel headers)"
-pkgs="dkms linux-headers-amd64"
+pkgs="dkms linux-headers-amd64 python3-pyside6.qtwidgets"
 dpkg -s "linux-headers-$(uname -r)" >/dev/null 2>&1 || pkgs="$pkgs linux-headers-$(uname -r)"
 if [ "${DSP_FROM##*.}" = "exe" ]; then pkgs="$pkgs innoextract"; fi
 missing=""
@@ -66,7 +66,9 @@ install -D -m 0644 "$REPO/pulsar_uapi.h" /usr/include/sound/pulsar_uapi.h
 step "4/5 tools and boot service"
 install -d "$LIB/tools"
 install -m 0644 "$REPO"/tools/*.py "$LIB/tools/"
-install -m 0755 "$REPO/tools/pulsar_loader.py" "$REPO/tools/pulsard.py" "$REPO/tools/pulsarctl.py" "$LIB/tools/"
+install -m 0755 "$REPO/tools/pulsar_loader.py" "$REPO/tools/pulsard.py" "$REPO/tools/pulsarctl.py" \
+	"$REPO/tools/pulsar_scope.py" "$LIB/tools/"
+install -D -m 0644 "$REPO/packaging/pulsar-scope.desktop" /usr/share/applications/pulsar-scope.desktop
 ln -sf "$LIB/tools/pulsarctl.py" /usr/bin/pulsarctl
 install -m 0755 "$REPO/packaging/pulsar-start" "$LIB/"
 install -m 0644 "$REPO/packaging/snd-pulsar@.service" /etc/systemd/system/

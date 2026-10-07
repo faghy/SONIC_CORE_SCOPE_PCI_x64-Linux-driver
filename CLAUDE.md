@@ -186,5 +186,11 @@ sudo rmmod snd-pulsar
    After set_controls every DSP frame goes through PULSAR_IOCTL_SEND_MSG (kernel fifo_mutex): the kernel also writes the FIFO
    (mixer), and a userspace-cached write index went stale ("command FIFO stalled").
    Default graph node ids: pc_play, pc_rec, n1 Analog Init, n2 Analog Out, n3 Analog In, n4/n7 PC Volume L/R,
-   n5/n8 Monitor Volume L/R, n6/n9 Mix L/R. Next: stage 2 = Qt (PySide6) GUI "Pulsar Scope" talking to pulsard.
+   n5/n8 Monitor Volume L/R, n6/n9 Mix L/R.
+4e. **GUI "Pulsar Scope" v1: WORKING (2026-10-08).** `tools/pulsar_scope.py` (PySide6, Fusion style + own dark palette, so it
+   is desktop independent), installed to /usr/lib/snd-pulsar/tools + /usr/share/applications/pulsar-scope.desktop.
+   Library tree by category (other boards' and hardware I/O modules hidden), drag & drop modules, drag cables pad->pad
+   (handled in RackView.mousePressEvent: NO grabMouse, it froze the app), Delete/right-click removes, double-click opens
+   input sliders (0..max of the pad; Apply sends only moved sliders). Layout in ~/.config/pulsar-scope/layout.json.
+   Verified by the user: sine -> LINVOL -> Mix L/R audible on both channels.
 5. **Next:** ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), JACK/Ardour check, .deb package, then the SCOPE-like config app.
