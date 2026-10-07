@@ -10,13 +10,14 @@ Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `
 | Rilevamento PCI, mappatura BAR0, IRQ | funziona |
 | Avvio dei 6 DSP (caricamento OS `puls2os*.21k`) | **funziona**: ogni DSP risponde |
 | Clock audio interno 44,1 kHz | **funziona** (verificato: 44.095 campioni/s) |
-| 48 kHz, clock esterno | implementato, non ancora testato |
+| 48 kHz | **funziona** (predefinito, come PipeWire) |
+| Clock esterno | implementato, non ancora testato |
 | Caricamento moduli DSP (linker), uscite analogiche | **funziona**: tono di prova sulle uscite 1/2 |
 | Riproduzione audio dal PC (ALSA PCM, PipeWire) | **funziona**: uscita "Pulsar2 Stereo" |
 | Registrazione dagli ingressi analogici 1/2 | **funziona**: ingresso "Pulsar2 Stereo" |
 | Monitor diretto ingressi → uscite, volumi in `alsamixer` | **funziona**: "DSP Out", "Input Monitor" |
 | Installazione con avvio automatico (DKMS + servizio systemd) | **funziona**: la scheda parte da sola all'accensione |
-| 48 kHz, ADAT/S/PDIF/MIDI, verifica JACK/Ardour, app di configurazione | da fare |
+| ADAT/S/PDIF/MIDI, verifica JACK/Ardour, app di configurazione | da fare |
 
 ## Architettura
 

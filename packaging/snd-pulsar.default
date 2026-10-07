@@ -8,5 +8,5 @@ PULSAR_DSP_DIR=/var/lib/snd-pulsar/dsp
 #   --pcm            PC playback (analog out 1/2) and capture (analog in 1/2)
 #   --volume DB      initial "DSP Out" level (safety gain), e.g. -30
 #   --monitor DB     direct monitoring of analog in -> out (omit to disable), max -6
-#   --rate 44100     44100 or 48000 (48000 not yet tested)
-PULSAR_ARGS="--pcm --volume -30 --monitor -12"
+#   --rate 48000     44100 or 48000 (48000 matches PipeWire, no resampling)
+PULSAR_ARGS="--pcm --volume -30 --monitor -12 --rate 48000"

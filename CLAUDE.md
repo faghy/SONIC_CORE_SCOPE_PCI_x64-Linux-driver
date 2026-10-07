@@ -147,7 +147,8 @@ sudo rmmod snd-pulsar
 2. **Sample rate / clock: WORKING at 44.1 kHz (2026-10-07).** `boot` now runs `finish_run()` (docs/clock_rate.md):
    backplateID=2 (PPlate, 11-bit cfg word, 0x484 = 44.1k internal), uC serial via DSP5, FScale/asRatio, sysmsg 0xB, clock resync.
    Verified: DSP `wclk` advances 44095/s (`pulsar_test.sh clock`). NOTE: BAR+0x10 is NOT a 1:1 sample counter (≈11.6k/s, wraps).
-   48 kHz (`--rate 48000`) implemented but not yet tested on hardware.
+   48 kHz VERIFIED (2026-10-07): `--rate 48000` -> plate cfg 0x402, FScale 0x40000000, asRatio 15; BAR+0x10 47995/s,
+   IRQ 46.8/s, ALSA hw_params rate 48000. 48 kHz is now the default in /etc/default/snd-pulsar (matches PipeWire).
 3. **Module linker: implemented offline (2026-10-07), not yet run on hardware.** Spec: docs/module_loading.md;
    code: `tools/pulsar_modules.py` (`selftest`, `link --ops --disasm`, `dryrun`). Libraries (.ol) auto-pulled,
    first-fit Sim2k heaps, reloc 2/3/4/6, init via sysmsg 2/7, sync chain via `ret_sync` patch (sysmsg 6 + codeBuf),
@@ -178,4 +179,4 @@ sudo rmmod snd-pulsar
    udev rule /etc/udev/rules.d/70-snd-pulsar.rules -> snd-pulsar@hwC<n>D0.service (pulsar-start: loader boot + alsactl restore).
    After reboot check: `systemctl status 'snd-pulsar@*'`, `journalctl -b -u 'snd-pulsar@*'`, `wpctl status` (Pulsar2 sink/source),
    `amixer -c Pulsar2 contents`. Repo test scripts (pulsar_test.sh reload/insmod) would now fight the installed module.
-5. **Next:** 48 kHz test, ADAT/S/PDIF/MIDI, JACK/Ardour check, .deb package, then the SCOPE-like config app.
+5. **Next:** ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), JACK/Ardour check, .deb package, then the SCOPE-like config app.
