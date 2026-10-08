@@ -75,7 +75,7 @@ Riavvia (o ricarica il modulo) e la scheda parte da sola. Si rimuove con `sudo a
 
 ## Ardour (e altre applicazioni JACK)
 
-Provato con Ardour 8.12 su Debian 13: riproduzione e registrazione dagli ingressi analogici.
+Provato con Ardour 8.12 su Debian 13: riproduzione, registrazione dagli ingressi analogici e tracce MIDI che suonano il synth sul DSP.
 Usa il backend **JACK** servito da PipeWire (non il backend ALSA di Ardour: la scheda è già di PipeWire e
 il suo buffer ha 4 periodi da 1024 campioni):
 

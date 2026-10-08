@@ -78,7 +78,7 @@ Reboot (or reload the module): the card starts by itself. Remove with `sudo apt 
 
 ## Ardour (and other JACK applications)
 
-Tested with Ardour 8.12 on Debian 13: playback and recording from the analog inputs.
+Tested with Ardour 8.12 on Debian 13: playback, recording from the analog inputs and MIDI tracks playing the DSP synth.
 Use the **JACK** backend served by PipeWire (do not use Ardour's ALSA backend: PipeWire owns the card and the
 card's buffer has 4 periods of 1024 frames):
 

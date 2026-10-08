@@ -223,8 +223,8 @@ sudo rmmod snd-pulsar
    MVC Tune Tab = ABSOLUTE phase increments (default input -> tunedeftab); writing zeros = frequency 0 (old bug).
    Debug: `pulsarctl peek id=<dev> key=<inner> pad=in|ao|so index=N count=K` or `dsp=D sym=NAME|addr=A` (read-only DSP DM).
 4j. **Ardour 8.12: WORKING (2026-10-08)** via JACK backend on pipewire-jack (deb Recommends it; ld.so.conf.d copy of
-   pipewire-jack-x86_64-linux-gnu.conf). Verified by the user: import+playback, recording from analog in. JACK ports:
+   pipewire-jack-x86_64-linux-gnu.conf). Verified by the user: import+playback, recording from analog in, MIDI track -> DSP test synth. JACK ports:
    "Pulsar2 Stereo:capture_FL/FR, playback_FL/FR", "Pulsar2 MIDI:Synth In"; 48 kHz, buffer 1024. Ardour's ALSA backend is
    not usable (PipeWire owns the card, periods fixed at 4).
-5. **Next:** factory synths (voice arrays from pc_midi), MIDI from Ardour to the DSP synth (port present, not yet tested),
+5. **Next:** factory synths (voice arrays from pc_midi),
    ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), then the SCOPE-like config app.
