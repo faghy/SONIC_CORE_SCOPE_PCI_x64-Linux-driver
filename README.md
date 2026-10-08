@@ -71,7 +71,7 @@ Alternatively, point the `PULSAR_DSP_DIR` variable to its `App/Dsp` folder.
 
 Download `snd-pulsar_<version>_all.deb` from the [Releases](https://github.com/faghy/SONIC_CORE_SCOPE_PCI_x64-Linux-driver/releases) page, then:
 ```bash
-sudo apt install ./snd-pulsar_0.5.1_all.deb                          # driver (DKMS), service, tools, Pulsar Scope
+sudo apt install ./snd-pulsar_0.6.0_all.deb                          # driver (DKMS), service, tools, Pulsar Scope
 sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe      # once: Sonic Core DSP files and devices
 ```
 Reboot (or reload the module): the card starts by itself. Remove with `sudo apt remove snd-pulsar`
