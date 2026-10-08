@@ -472,3 +472,126 @@ directly.
 - The `.pre` record → pad mapping.
 - `DelayTimeCalcEx` and the logic scripts used by dynamics devices.
 - MIDI ports: the plan lists them (`midi: true`), but pulsard has no MIDI routing yet.
+
+---------------------------------------------------------------------------------------------------
+## 9. Dynamic devices: the factory mixers (voices, connection-driven channels, host scripts)
+
+`Devices/Mixer/*.dev` (DynamicMixer, MicroMixer, STM 1632, STM 16 S, STM 48 S, ControlRoom, Channel) do not
+instantiate everything that is in the file. How many copies of a module exist is a **voice count**, and the
+mixers change voice counts at run time from host scripts. `scope_device.plan()` emulates this, and pulsard
+re-plans when one of the inputs changes.
+
+### 9.1 Voice counts [C]
+- Extras 0x102 on a RODModule (`RODModule::ReadExtraChunk` @10098f00) creates attribute 0x1E `NumVoices` and
+  calls `SetNumberOfVoices` (@1008e510). That function recurses into the children, but stops at a child that has
+  its own attribute ≥ 0.
+- `GetNumberOfVoices` (@10016b80): the nearest attribute ≥ 0, walking up the tree. If there is none, the
+  global default 1 is used.
+- `ROCAtom::ChangeVoices(n)` (@1008ade0) with **n = 0 frees the atom**: no DSP module exists. Inactive mixer
+  channels are saved like this (`numVoices 0` on the channel group).
+- **Single** atoms (module flag 0x10000) with flag 0x400000 and no voice-array pads (`32ADD`, `16ADD`) get
+  `pSetVoices(module, n)`, the `jmpVoiceDef → jmpVoice<n>` patch (midi_synths.md §3.5). `32ADD` then sums
+  inputs `In01..In<n>`, each times its gain pad `G<n>` (32 at most). Sync cycles = (word & 0xFFFF) +
+  n·(word >> 16): `32ADD` = 9 + 2n.
+- `DynVoicesOfParent.pep` sets the voice count of the module that contains it from its `Voices` pad
+  (`SetNumVoices`). −1 means "inherit".
+- Plan: `modules[].voices`, `set_voices: [{key, voices}]` (SetVoices for the single atoms), `dropped` (atoms
+  with 0 voices; their wires, constants and parameter targets are left out). Ports always come from the whole
+  device, so the port list does not depend on the voices. Parameters whose targets are all dropped stay in the
+  list with `inactive: true`. A poly-capable atom (not single) with more than 1 voice would need one instance
+  per voice. That is still `unsupported`, and none of the mixers has one.
+
+### 9.2 What drives the voice counts [C/V]
+The `Voices` pads are wired, through small logic scripts, to:
+- **pad connections**: `RouteByContext.pep` (the pad's routing menu) sets `Connected` = 1 in
+  `OnRoutingAdded`; `PadName` is the device port. DynamicMixer channel k exists while `In<k>` is connected.
+  STM 1632 channel k exists while `In<k>` or `IR<k>` is connected (`Or`), and its direct-out gains while
+  `D<k>`/`DR<k>` are connected. STM aux buses exist while `Aux<k>` is connected.
+- **panel controls**: MicroMixer `Select Channel` (4..16) is the channel count: the master adders get n voices,
+  and channel k gets `If(count > k−1)`. DynamicMixer `Select Channel` enables the group masters of channels 5-8,
+  9-12 and 13-16, so it must be at least the highest channel that is used. `Stereo` / `Stereo/Mono` buttons
+  (Val 1 = **mono**, 0 = stereo) remove or add the right-channel modules. `Activate Phase Compensation` /
+  `Phase Compensation` adds the CompDel modules.
+- Emulated logic (`Device._eval_logic`, a fixpoint over the host nets): `If` (Condition `=` `<` `>` `!` and
+  two-character forms such as `>=`), `Or` (== 1), `And` (!= 0), `Not`, `MaxOf2`; `RouteByContext.Connected`.
+  Routing switches and **Layers** that are fed by this logic follow the new values.
+- **Layer.pep** (routing recorder, used by the mixers for mono/stereo routing and links): member pads =
+  (`ModuleNum[i]` = `GetUniqueNumber()` = the `index` field of a sibling module, `PadNum[i]` = index in its pad
+  list: the atom's or script's variables, else its RODPads). `LayerState` children hold `LayerRouting`
+  (ModuleNum1/PadNum1/ModuleNum2/PadNum2). `OnActiveStateChanged` removes the routings among the member pads
+  and restores those of the active state. `Device._layers` re-does this from `ActiveState`. It reproduces the
+  saved routing of every mixer.
+- `plan(..., switch_values)` keys: `"@connected": [port names]` (`RouteByContext`), `"@channels": n` (count
+  net of a count-driven mixer), a knob key (override of the knob's Val, e.g. `Select Channel`, `Stereo`), a
+  switch key, a Layer key. Plan output: `dynamic_ports` (the ports whose connection matters) and `structure`.
+- Parameter target `{kind: "structure", key, reach}`: the knob value is a plan input. `targets_raw` returns
+  `(key, "switch", Val)`, and pulsard re-plans.
+
+### 9.3 Multi-input host scripts emulated with live state [C/V]
+The channel strips compute their DSP gains on the host from several controls. In `HOST_FUNCS` they are Python
+ports of the `.pep`. Their `float` variables are IEEE single precision: `pivier` and `Panf` must be float32,
+otherwise L/R differ in the last 6 bits.
+
+| pep | inputs | outputs → DSP | used by |
+|---|---|---|---|
+| `Pan` | Pan, Mono, Mode (0 = 3 dB sin law, 1 = linear; Mono 0 = balance) | L, R → deZipper / Attenuator factor | DynamicMixer, MicroMixer, StereoPan |
+| `Attenuator` with a variable factor | In, Attenuator, Factor | Out (In·Att/0x7fffffff·Factor, clipped) | MicroMixer faders (fader · pan), MasterVerb level scalers |
+| `ValToInvertGain` | Val, Invert | Out = ±Val | DynamicMixer Gain + Invert Phase |
+| `Ch1632X` | Fader, Pan, Mode, Mono, Mute, Mix, AxF1-4, Pre1-4 | MixL/MixR → `Master L/R` G<k>, Asd1-4 → `Aux k` G<k> | STM 1632 |
+| `SurroundpanSTM16` | PLR, PFB (−1..1), IDiv, LFEP, Fader, Mute, SoSw, L/R/Ls/Rs/C, AxF1-4, Pre1-4 | FroL/FroR/Cent/ReaL/ReaR/LFE/Asd1-4 → bus adders | STM 16 S |
+
+Plan: `host_funcs: [{key, pep, state, outputs: {var: [targets]}}]`. A parameter target `{kind: "host",
+script, var, chain}` updates one input. `host_func_update(host_funcs, script, var, value, rate)` returns the
+DSP writes. `host_func_outputs(hf)` gives all of them, and pulsard writes them after a (re)build. Check: for all
+138 complete devices, the 877 outputs computed from the saved inputs are equal to the saved DSP pad values.
+Not emulated (left at their saved state): `SoloLogic` (Solo, Defeat, Kill Solo), `FaderGroup` /
+`MuteGroupLogic` (group linking), `Diode`, `EffectInserter` (insert slots).
+
+### 9.4 Compensate Delay Linker [C]
+The atom has no `.dsp` file. In Sim2k it is a host object (`compensate_delay_link_module`, the name compare at
+FUN_10c58fd0). For every sibling module named `CompDel:` (compdel8/16/32.dsp), it computes
+`delay_i = max_latency − (latency_i + offset_i)` (offsets = the linker's D<n> input values, at most 16 samples)
+and writes the result into the module's `delayLen` array (FUN_10c590a0 / FUN_10c59590). The input latencies come
+from Sim2k's latency tracking of inserted effects. Linux has no inserts with latency, so the linker is treated as
+host-only (`host_atoms` in the plan, no DSP module) and the CompDel delays stay at their loaded value (0). The
+CompDel modules themselves exist only while phase compensation is on (their voices come from the Phase
+Compensation button).
+
+### 9.5 MIDI ports
+The mixers have `MIn`/`MOut` (or `MIDI`) ports for controller automation. Only `M_C_*` controller modules
+(`M_C_MOD` channel filter, `M_C_IO7`) use them, and those have 0 voices until a MIDI pad is connected. The plan
+has `midi_ports` and `midi_optional: true`. `needs_midi` is true only if a module with a MIDI pad is not an
+`M_C_*` module (synth note input). pulsard's survey keeps such devices, and the MIDI pads may stay open.
+
+### 9.6 Parameter naming for channel strips
+Parameters that drive one strip get `strip` (`Ch<n>` or `Ax<n>` for the STM 16 S aux returns), `channel` (n for
+Ch) and `base_name`. The strip comes from the target module path (`…/5/…`, `…/Ch5/…`, `…/Ax3/…`), or for a bus
+adder gain pad `G<n>` from what feeds `In<n>`. Duplicate names become `"<strip> <base_name>"`, for example
+`Ch5 Fader` or `Ch5 Pan Position`. Other duplicates become `"<group> <index> <base_name>"`, where the index is
+1 + the number of copy marks (') of the differing path component (`AuxGroup 3 Fader`, `Master 2 Mute`). Any that
+are still equal get the script input name, or `#n`. `structure: true` marks a control that re-plans.
+
+### 9.7 pulsard
+- `load_device` starts a dynamic device with nothing connected. Structure and switch controls given in `params`
+  go into the first plan.
+- `connect` and `disconnect` on a port in `dynamic_ports` re-plan the device. During `load_project` this happens
+  once, at the end.
+- The re-plan diff (`_replan_diff`) unloads modules that lost their voices, after silencing their readers. It
+  loads new ones on the device's DSP and applies SetVoices, the wire diff and the constants of the new modules.
+  It re-links the ports, writes the host-script outputs and re-sends the parameters the user set.
+- If the new modules do not fit on the device's DSP, the device is rebuilt and placed again. If the change fails,
+  the previous structure is rebuilt.
+- Placement (`_place`): the whole device goes on the least loaded DSP if it fits. Otherwise the module tree is
+  split by sub-trees, so a mixer channel group stays together. Cross-DSP sync wires need a slot in the source
+  DSP's sync block (about 11 per DSP).
+- pulsard re-uses the sync slots of unloaded modules. pulsar_modules never frees them.
+- Projects store `structure: {"@connected": [...]}`.
+- Measured cycles at 48 kHz (budget ≈ 937 per DSP with the 25 % reserve), see the pulsard report in the
+  repository history:
+
+| device | nothing connected | typical full use |
+|---|---|---|
+| DynamicMixer | 120 | 536 (16 mono channels in) / 695-711 (Select Channel 16) |
+| MicroMixer | 162 (4 channels) | 359-367 (16 channels, `Select Channel` 16) |
+| STM 1632 | 358 | 650 (+ aux buses) / 778 (+ 16 direct outs) |
+| STM 16 S | 618 | 782 |

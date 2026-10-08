@@ -34,7 +34,9 @@ to the PC (ALSA capture, fixed to the analog inputs for now).
 import argparse
 import grp
 import json
+import math
 import os
+import re
 import signal
 import socket
 import socketserver
@@ -56,9 +58,24 @@ class GraphError(Exception):
     pass
 
 
+class _NeedRebuild(Exception):
+    """A dynamic device grew past its DSP: rebuild it instead of adding the new modules elsewhere."""
+
+
+POLY_FLAG = 0x00400000            # module flag: voice count set with SetVoices (32ADD, 16MIX, MVC ...)
+
+
 def cycles(cls):
     """Sync cycles per sample of a module class (the descriptor word carries flags in its high bits)."""
     return cls.syncCycles & 0xFFFF
+
+
+def mod_cycles(mod):
+    """Sync cycles of a loaded module: polyphonic modules add (cycles >> 16) per voice (scope_device.voice_cycles)."""
+    c = mod.cls.syncCycles
+    if mod.cls.flags & POLY_FLAG:
+        return (c & 0xFFFF) + (c >> 16) * max(1, getattr(mod, "voices", None) or 1)
+    return c & 0xFFFF
 
 
 def _s32(v):
@@ -70,13 +87,17 @@ def _survey_one(path, dsp_dir, devices_dir):
     try:
         import scope_device as sd
         p = sd.plan(path, dsp_dir)
+        full = None
+        if p.get("dynamic_ports"):           # dynamic mixer: pulsard loads it with nothing connected
+            full = sd.plan(path, dsp_dir, {"@connected": p["dynamic_ports"]})
+            p = sd.plan(path, dsp_dir, {"@connected": []})
     except Exception:
         return None
     if not p.get("complete") or p.get("needs_midi"):
         return None
     import pulsar_license as plic
     lic = set()
-    for m in p["modules"]:
+    for m in p["modules"] + (full["modules"] if full else []):
         if m.get("kind") == "pc_delay" or not m.get("dsp_file"):
             continue
         try:
@@ -86,12 +107,18 @@ def _survey_one(path, dsp_dir, devices_dir):
         if plic.needs_unlock(cls):
             lic.add(tuple(plic.module_seg_id(cls)))
     rel = os.path.relpath(path, devices_dir)
-    return {"file": rel, "name": p["name"], "category": os.path.dirname(rel), "cycles": p["dsp_cycles"],
-            "modules": len(p["modules"]),
-            "inputs": [q["name"] for q in p["ports"] if q["dir"] == "in"],
-            "outputs": [q["name"] for q in p["ports"] if q["dir"] == "out"],
-            "params": [q["name"] for q in p["params"] if not q.get("hidden") and q.get("targets")],
-            "pc_delay": bool(p.get("pc_delays")), "licensed": [list(x) for x in sorted(lic)]}
+    row = {"file": rel, "name": p["name"], "category": os.path.dirname(rel), "cycles": p["dsp_cycles"],
+           "modules": len(p["modules"]),
+           "inputs": [q["name"] for q in p["ports"] if q["dir"] == "in"],
+           "outputs": [q["name"] for q in p["ports"] if q["dir"] == "out"],
+           "params": [q["name"] for q in p["params"] if not q.get("hidden") and (q.get("targets") or q.get("inactive"))],
+           "pc_delay": bool(p.get("pc_delays")), "licensed": [list(x) for x in sorted(lic)]}
+    if p.get("midi_optional"):
+        row["midi_optional"] = True
+    if full is not None:
+        row.update(dynamic=True, cycles_max=full["dsp_cycles"], modules_max=len(full["modules"]),
+                   complete_max=bool(full.get("complete")))
+    return row
 
 
 class Node:
@@ -137,14 +164,19 @@ class Node:
              "inputs": self.inputs(), "outputs": self.outputs()}
         if self.mod is not None:
             d.update(file=self.mod.cls.name, name=self.mod.cls.short, long=self.mod.cls.long,
-                     cycles=cycles(self.mod.cls))
+                     cycles=mod_cycles(self.mod))
         if self.dev is not None:
             pl_ = self.dev["plan"]
+            if pl_.get("dynamic_ports"):
+                d.update(dynamic_ports=pl_["dynamic_ports"], dsps=self.dev.get("dsps"),
+                         connected=self.dev["switch_values"].get("@connected", []))
             d.update(file=self.dev["file"], cycles=pl_["dsp_cycles"], modules=len(self.dev["inner"]),
                      params=[dict(name=q["name"], unit=q.get("unit") or "", min=q.get("min"), max=q.get("max"),
                                   default=q.get("default"), curve=q.get("curve"), discrete=bool(q.get("discrete")),
                                   format=q.get("display_format") or q.get("format"),
                                   value=self.dev["params"].get(q["name"]),
+                                  **{k: q[k] for k in ("strip", "channel", "base_name", "group", "index",
+                                                        "structure", "inactive") if k in q},
                                   spec={k: q.get(k) for k in ("knob", "display", "val_min", "val_max",
                                                                "val_default", "control")})
                              for q in self.dev["params_list"]])
@@ -191,6 +223,34 @@ class Graph:
         self.state_file = None                               # autosave target (set by main)
         self.host_words = pdl.HostWords()                    # BAR dwords for DSP async -> host delay times
         self._pc_delay_ok = None
+        self._bulk = False                                   # project import: re-plan dynamic devices once at the end
+        self._slot_pool = {d.dspno: [] for d in self.rack.dsp}
+        for d in self.rack.dsp:
+            d.alloc_sync_output = self._reuse_sync_slot(d, d.alloc_sync_output)
+
+    # ---- cross-DSP sync slots: pulsar_modules never gives a slot back (tcb_count only grows, 11 per DSP);
+    # pulsard keeps the slots of unloaded modules and hands them out again (their readers were re-linked)
+    def _reuse_sync_slot(self, d, orig):
+        pool = self._slot_pool[d.dspno]
+
+        def alloc(mod, j):
+            if mod.sync_slots[j] >= 0 or not pool:
+                return orig(mod, j)
+            slot = pool.pop(0)
+            mod.sync_slots[j] = slot
+            ops = []
+            if mod.loaded and mod.syncout_sites.get(j):
+                op = d._patch_op(mod.syncout_sites[j], slot, "%s: sync out %d -> reused slot 0x%x" % (mod.name, j, slot))
+                if op is not None:
+                    ops.append(op)
+            return slot, ops
+        return alloc
+
+    def _unload_mod(self, mod):
+        ops = self.rack.unload(mod)
+        self._slot_pool[mod.dsp] += [x for x in mod.sync_slots if x >= 0]
+        mod.sync_slots = [-1] * len(mod.sync_slots)
+        return ops
 
     # ---- bookkeeping
     def add_node(self, kind, title, mod=None, dsp=None, fixed=False, nid=None):
@@ -209,7 +269,7 @@ class Graph:
         budget = int(CORE_CLOCK / self.rate * (1 - CYCLE_RESERVE))
         out = []
         for d in self.rack.dsp:
-            cyc = sum(cycles(m.cls) for m in d.modules)
+            cyc = sum(mod_cycles(m) for m in d.modules)
             out.append({"dsp": d.dspno, "modules": len(d.modules), "cycles": cyc, "budget": budget,
                         "pm_free": sum(n for _, n in d.pm.free_ranges()),
                         "dm_free": sum(n for _, n in d.dm.free_ranges())})
@@ -266,6 +326,9 @@ class Graph:
             pass
         return cat
 
+    def _dsp_cycles(self, d):
+        return sum(mod_cycles(m) for m in self.rack.dsp[d].modules)
+
     def _pick_dsp(self, cls):
         fixed = (cls.flags >> 17) & 0xF
         if fixed:
@@ -273,7 +336,7 @@ class Graph:
         budget = CORE_CLOCK / self.rate * (1 - CYCLE_RESERVE)
         best = None
         for d in (2, 3, 4, 5, 1, 0):                # keep DSP0/1 (analog I/O) for last
-            cyc = sum(cycles(m.cls) for m in self.rack.dsp[d].modules)
+            cyc = self._dsp_cycles(d)
             if cyc + cycles(cls) <= budget and (best is None or cyc < best[1]):
                 best = (d, cyc)
         if best is None:
@@ -365,12 +428,31 @@ class Graph:
             raise GraphError("%s has no wirable inputs" % dst)
         targets = self._dst_eps(dst, inp)
         ep = self._src_ep(src, out)
+        prev = self.wires.get((dst, inp))
+        self.wires[(dst, inp)] = (src, out)
+        if self._is_dynamic(src) or self._is_dynamic(dst):
+            try:                                 # a mixer channel appears when its pad gets connected
+                if prev is not None and prev[0] != src:
+                    self._restructure(prev[0])
+                self._restructure(src)
+                self._restructure(dst)
+            except Exception:
+                if prev is None:
+                    self.wires.pop((dst, inp), None)
+                else:
+                    self.wires[(dst, inp)] = prev
+                raise
+            targets = self._dst_eps(dst, inp)
+            ep = self._src_ep(src, out)
         for dn, i in targets:
             self._link(ep, dn, i)
         self.values.pop((dst, inp), None)
-        self.wires[(dst, inp)] = (src, out)
         if self.nodes[dst].kind == "device":
             self._refresh_from(dst)
+
+    def _is_dynamic(self, nid):
+        n = self.nodes.get(nid)
+        return n is not None and n.kind == "device" and bool(n.dev["plan"].get("dynamic_ports"))
 
     def disconnect(self, dst, inp):
         dn = self.node(dst)
@@ -378,8 +460,12 @@ class Graph:
             raise GraphError("%s inputs cannot be changed" % dst)
         for t, i in self._dst_eps(dst, inp):
             self._link(None, t, i)
-        self.wires.pop((dst, inp), None)
+        w = self.wires.pop((dst, inp), None)
         self.values.pop((dst, inp), None)
+        if w is not None and self._is_dynamic(w[0]):
+            self._restructure(w[0])
+        if self._is_dynamic(dst):
+            self._restructure(dst)
         if dn.kind == "device":
             self._refresh_from(dst)
 
@@ -407,6 +493,8 @@ class Graph:
             raise GraphError("%s is part of the base configuration" % nid)
         if n.parent is not None and not _inner:
             raise GraphError("%s belongs to device %s: remove the device" % (nid, n.parent))
+        if n.kind == "device":
+            n.dev["unloading"] = True
         for (d, i), (s_, o) in list(self.wires.items()):
             if s_ == nid and d != "pc_rec":
                 self.disconnect(d, i)
@@ -414,14 +502,11 @@ class Graph:
             if d == nid:
                 self.wires.pop((d, i))
         if n.kind == "device":
-            for key in reversed(n.dev["plan"]["order"]):
-                inner = n.dev["inner"].get(key)
-                if inner in self.nodes:
-                    self.unload(inner, _inner=True)
+            self._teardown(n)
         elif n.kind == "pc_delay":
             self._free_pc_delay(n)
         else:
-            self.execute(self.rack.unload(n.mod))
+            self.execute(self._unload_mod(n.mod))
         for k in [k for k in self.values if k[0] == nid]:
             self.values.pop(k)
         del self.nodes[nid]
@@ -508,7 +593,7 @@ class Graph:
              "b": {"kind": "db", "keys": ["Out"], "in": 1}},
         ]
         plan = {"name": "Pulsar Test Synth", "order": keys, "modules": [], "wires": [], "consts": [],
-                "dsp_cycles": sum(cycles(self.nodes[n].mod.cls) for n in inner.values()), "params": params,
+                "dsp_cycles": sum(mod_cycles(self.nodes[n].mod) for n in inner.values()), "params": params,
                 "ports": [{"name": "MIDI In", "dir": "in", "sync": False, "midi": True,
                            "target": ["MVC", 0], "targets": [["MVC", 0]]},
                           {"name": "Out", "dir": "out", "sync": True, "target": ["Out", 0], "targets": [["Out", 0]]}]}
@@ -551,68 +636,235 @@ class Graph:
                     out.append(m["dsp_file"])
         return sorted(set(out))
 
-    def load_device(self, file, dsp=None, title=None, params=None):
+    def load_device(self, file, dsp=None, title=None, params=None, structure=None):
+        """Build a SCOPE device as one node.  `structure` = plan inputs of dynamic devices (docs/device_format.md
+        §10): {"@connected": [port names]} for the mixers whose channels exist only while their pads are
+        connected; knob overrides are set through the structure parameters instead."""
         import scope_device as sd
         if file in self.BUILTINS:
             return self._load_builtin(file, dsp, title, params)
         path = self._device_path(file)
-        p = self._plan(path)
-        free = [m for m in p["modules"] if m["fixed_dsp"] is None]
-        if dsp is None and free:                     # keep a device on one DSP when it fits
-            budget = CORE_CLOCK / self.rate * (1 - CYCLE_RESERVE)
-            need = sum(m["cycles"] for m in free)
-            best = None
-            for d in (2, 3, 4, 5, 1, 0):
-                cyc = sum(cycles(m.cls) for m in self.rack.dsp[d].modules)
-                if cyc + need <= budget and (best is None or cyc < best[1]):
-                    best = (d, cyc)
-            # many host delay lines = many capture slots: only DSP5's sync block can grow past 11 (pc_delay.md §6)
-            if len(p.get("pc_delays") or []) > 8 and \
-                    sum(cycles(m.cls) for m in self.rack.dsp[5].modules) + need <= budget:
-                best = (5, 0)
-            if best is None:
-                raise GraphError("no DSP has %d free cycles for %s" % (need, p["name"]))
-            dsp = best[0]
+        p0 = self._plan(path)
+        sv = {}
+        if p0.get("dynamic_ports"):                 # pulsard state: nothing is connected to a new device
+            sv["@connected"] = sorted(set((structure or {}).get("@connected") or []) & set(p0["dynamic_ports"]))
+        # routing switch / structure controls given up front: one plan instead of a re-plan per control
+        plist = {q["name"]: q for q in self._params_list(p0)}
+        for name, v in (params or {}).items():
+            if name in plist and "b" not in plist[name] and v is not None:
+                for key, inp, raw in sd.targets_raw(plist[name], float(v), self.rate):
+                    if inp == "switch":
+                        sv[key] = raw
+        p = self._plan(path, sv) if sv else p0
         dev_id = "n%d" % self._next
         self._next += 1
-        inner = {}
+        rel = os.path.relpath(path, self.devices_dir) if self.devices_dir and path.startswith(self.devices_dir) else path
+        node = Node(dev_id, "device", title or p["name"], dsp=dsp)
+        node.dev = {"file": rel, "path": path, "plan": p, "switch_values": sv, "applied": dict(sv), "inner": {},
+                    "in_names": [q["name"] for q in p["ports"] if q["dir"] == "in"],
+                    "out_names": [q["name"] for q in p["ports"] if q["dir"] == "out"],
+                    "params_list": self._params_list(p), "params": {}, "user_params": set(),
+                    "host_funcs": self._host_funcs(p), "dsps": []}
+        self.nodes[dev_id] = node
         try:
-            for key in p["order"]:
-                m = next(x for x in p["modules"] if x["key"] == key)
-                if m.get("kind") == "pc_delay":
-                    nid = self._new_pc_delay(m, key)
-                else:
-                    nid = self.load(m["dsp_file"], m["fixed_dsp"] if m["fixed_dsp"] is not None else dsp,
-                                    key.split("/")[-1])
-                self.nodes[nid].parent = dev_id
-                inner[key] = nid
-            self._setup_pc_delays(p, inner)      # before the wires: sources move to comm slots
-            for w in p["wires"]:
-                if self.nodes[inner[w["dst_key"]]].kind == "pc_delay" and w["in"] == 0:
-                    continue                     # done by _setup_pc_delays
-                self._link((inner[w["src_key"]], w["out"]), inner[w["dst_key"]], w["in"])
-            for c in p["consts"]:
-                self.set_value(inner[c["key"]], c["in"], sd.const_raw(c, self.rate))
+            self._build(node, dsp)
         except Exception:
-            for nid in reversed(list(inner.values())):
+            self._teardown(node)
+            del self.nodes[dev_id]
+            raise
+        for q in node.dev["params_list"]:
+            node.dev["params"][q["name"]] = q.get("default")
+        for name, v in (params or {}).items():
+            if name in node.dev["params"] and v is not None:
+                self.set_param(dev_id, name, v)
+        return dev_id
+
+    def _build(self, n, dsp=None):
+        """Load and wire all modules of the device's current plan (n.dev["inner"] must be empty)."""
+        import scope_device as sd
+        p, inner = n.dev["plan"], n.dev["inner"]
+        place = self._place(p, [m for m in p["modules"] if m.get("kind") != "pc_delay"], dsp, p["name"])
+        for key in p["order"]:
+            m = next(x for x in p["modules"] if x["key"] == key)
+            if m.get("kind") == "pc_delay":
+                nid = self._new_pc_delay(m, key)
+            else:
+                nid = self.load(m["dsp_file"], place[key], key.split("/")[-1])
+            self.nodes[nid].parent = n.id
+            inner[key] = nid
+        self._set_voices(p, inner)
+        self._setup_pc_delays(p, inner)          # before the wires: sources move to comm slots
+        for w in p["wires"]:
+            if self.nodes[inner[w["dst_key"]]].kind == "pc_delay" and w["in"] == 0:
+                continue                         # done by _setup_pc_delays
+            self._link((inner[w["src_key"]], w["out"]), inner[w["dst_key"]], w["in"])
+        for c in p["consts"]:
+            self.set_value(inner[c["key"]], c["in"], sd.const_raw(c, self.rate))
+        n.dev["dsps"] = sorted({self.nodes[x].dsp for x in inner.values() if self.nodes[x].dsp is not None})
+        n.dsp = n.dev["dsps"][0] if n.dev["dsps"] else dsp
+        self._push_host_funcs(n)
+        for k, name in enumerate(n.dev["in_names"]):         # pads already wired (rebuild)
+            w = self.wires.get((n.id, k))
+            if w:
+                port = next((q for q in p["ports"] if q["dir"] == "in" and q["name"] == name), None)
+                ep = self._src_ep(*w)
+                for key, i in (port or {}).get("targets") or []:
+                    self._link(ep, inner[key], i)
+
+    def _teardown(self, n):
+        inner = n.dev["inner"]
+        order = [k for k in reversed(n.dev["plan"]["order"]) if k in inner] + \
+                [k for k in inner if k not in n.dev["plan"]["order"]]
+        for k in order:
+            nid = inner.pop(k)
+            if nid in self.nodes:
                 try:
                     self.unload(nid, _inner=True)
                 except Exception:
                     pass
-            raise
-        rel = os.path.relpath(path, self.devices_dir) if self.devices_dir and path.startswith(self.devices_dir) else path
-        node = Node(dev_id, "device", title or p["name"], dsp=dsp)
-        node.dev = {"file": rel, "path": path, "plan": p, "switch_values": {}, "inner": inner,
-                    "in_names": [q["name"] for q in p["ports"] if q["dir"] == "in"],
-                    "out_names": [q["name"] for q in p["ports"] if q["dir"] == "out"],
-                    "params_list": [q for q in p["params"] if not q.get("hidden") and q.get("targets")],
-                    "params": {}}
-        self.nodes[dev_id] = node
-        for q in node.dev["params_list"]:
-            node.dev["params"][q["name"]] = q.get("default")
-        for name, v in (params or {}).items():
-            self.set_param(dev_id, name, v)
-        return dev_id
+
+    def _rebuild(self, n):
+        """Unload every module of the device and build it again from its switch values (keeps the node, its
+        external wires and the parameter values)."""
+        self._teardown(n)
+        p = self._plan(n.dev["path"], n.dev["switch_values"])
+        n.dev.update(plan=p, params_list=self._params_list(p), host_funcs=self._host_funcs(p))
+        self._build(n)
+        n.dev["applied"] = dict(n.dev["switch_values"])
+        for name in sorted(n.dev.get("user_params") or ()):
+            if name in n.dev["params"] and any(q["name"] == name for q in n.dev["params_list"]):
+                self.set_param(n.id, name, n.dev["params"][name], _reapply=True)
+        self._refresh_from(n.id)
+
+    @staticmethod
+    def _params_list(p):
+        return [q for q in p["params"] if not q.get("hidden") and (q.get("targets") or q.get("inactive"))]
+
+    @staticmethod
+    def _host_funcs(p):
+        return [dict(h, state=dict(h["state"])) for h in p.get("host_funcs") or []]
+
+    def _set_voices(self, p, inner, only=None):
+        """SetVoices of the single-instance polyphonic modules (32ADD bus adders: number of inputs summed)."""
+        import pulsar_midi as pmid
+        for sv in p.get("set_voices") or []:
+            if sv["key"] in inner and (only is None or sv["key"] in only):
+                self.execute(pmid.set_voices_ops(self.rack, self.nodes[inner[sv["key"]]].mod, sv["voices"]))
+
+    def _push_host_funcs(self, n, only=None):
+        """Write the outputs of the emulated host scripts (Pan, Ch1632X ...) from their current state."""
+        import scope_device as sd
+        for hf in n.dev.get("host_funcs") or []:
+            if only is not None and hf["key"] not in only:
+                continue
+            for key, inp, raw in sd.host_func_outputs(hf, self.rate):
+                if inp == "host":
+                    rows = sd.host_func_update(n.dev["host_funcs"], key, raw[0], raw[1], self.rate)
+                else:
+                    rows = [(key, inp, raw)]
+                for k2, i2, r2 in rows:
+                    if i2 not in ("switch", "host") and k2 in n.dev["inner"]:
+                        self.set_value(n.dev["inner"][k2], i2, r2)
+
+    def _sync_slots_left(self, d):
+        x = self.rack.dsp[d]
+        lim, c, n = x.tcb_base_limit(), x.tcb_count, 0
+        while x.tcb_base + 2 * (c + 1) + 1 < lim:
+            c += 1
+            n += 1
+        return n + len(self._slot_pool.get(d, ()))
+
+    def _place(self, p, mods, dsp=None, name="device", prefer=None, grow=False):
+        """DSP of every plan module in `mods`: fixed modules keep theirs; the rest goes on one DSP when it fits
+        (least loaded, DSP0/1 last), else the device tree is split over several DSPs (whole sub-trees first,
+        so a mixer channel stays together).  Cross-DSP sync wires need a slot in the source DSP's sync block."""
+        import scope_device as sd
+        budget = CORE_CLOCK / self.rate * (1 - CYCLE_RESERVE)
+        load = {d: self._dsp_cycles(d) for d in range(len(self.rack.dsp))}
+        out = {}
+        free = []
+        for m in mods:
+            if m.get("fixed_dsp") is not None:
+                out[m["key"]] = m["fixed_dsp"]
+                load[m["fixed_dsp"]] += m["cycles"] or 0
+            else:
+                free.append(m)
+        order = (2, 3, 4, 5, 1, 0)
+        need = sum(m["cycles"] or 0 for m in free)
+        if dsp is not None:
+            for m in free:
+                out[m["key"]] = int(dsp)
+            return out
+        if not free:
+            return out
+        # many host delay lines = many capture slots: only DSP5's sync block can grow past 11 (pc_delay.md §6)
+        if len(p.get("pc_delays") or []) > 8 and load[5] + need <= budget:
+            return dict(out, **{m["key"]: 5 for m in free})
+        fits = [d for d in order if load[d] + need <= budget]
+        near = [d for d in (prefer or ()) if d in fits]        # a growing device stays where it is
+        if grow and not near:
+            raise _NeedRebuild()                 # place the whole device again (split by sub-trees)
+        if near or fits:
+            d = near[0] if near else min(fits, key=lambda x: (load[x], order.index(x)))
+            return dict(out, **{m["key"]: d for m in free})
+        # split: tree of module keys
+        root = {"mods": [], "kids": {}, "cyc": 0}
+        for m in free:
+            node = root
+            for comp in m["key"].split("/")[1:]:
+                node = node["kids"].setdefault(comp, {"mods": [], "kids": {}, "cyc": 0})
+            node["mods"].append(m)
+
+        def total(nd):
+            nd["cyc"] = sum(x["cycles"] or 0 for x in nd["mods"]) + sum(total(k) for k in nd["kids"].values())
+            return nd["cyc"]
+
+        def leaves(nd):
+            return list(nd["mods"]) + [x for k in nd["kids"].values() for x in leaves(k)]
+
+        used = [d for d in (prefer or ()) if d in load]
+
+        def pick(c):
+            cands = [d for d in used if load[d] + c <= budget] or \
+                    sorted((d for d in order if d not in used and load[d] + c <= budget), key=lambda x: load[x])
+            return cands[0] if cands else None
+
+        def assign(nd):
+            d = pick(nd["cyc"])
+            if d is not None:
+                for x in leaves(nd):
+                    out[x["key"]] = d
+                load[d] += nd["cyc"]
+                if d not in used:
+                    used.append(d)
+                return
+            if not nd["kids"]:
+                if len(nd["mods"]) > 1:
+                    for x in nd["mods"]:
+                        assign({"mods": [x], "kids": {}, "cyc": x["cycles"] or 0})
+                    return
+                raise GraphError("no DSP has %d free cycles for %s (%s)" % (nd["cyc"], nd["mods"][0]["key"], name))
+            for x in nd["mods"]:
+                assign({"mods": [x], "kids": {}, "cyc": x["cycles"] or 0})
+            for k in nd["kids"].values():
+                assign(k)
+
+        total(root)
+        assign(root)
+        # cross-DSP sync outputs per source DSP
+        cls_of = {m["key"]: m for m in mods}
+        need_slots = {}
+        for w in p["wires"]:
+            sk, dk = w["src_key"], w["dst_key"]
+            if sk in out and dk in out and out[sk] != out[dk]:
+                c = sd.module_class(self.dsp_dir, cls_of[sk]["dsp_file"])
+                if not isinstance(c, Exception) and w["out"] >= c.numAsyncOut:
+                    need_slots.setdefault(out[sk], set()).add((sk, w["out"]))
+        for d, sl in need_slots.items():
+            if len(sl) > self._sync_slots_left(d):
+                raise GraphError("%s does not fit: %d cross-DSP sync wires from DSP%d, %d slots left"
+                                 % (name, len(sl), d, self._sync_slots_left(d)))
+        return out
 
     def _load_builtin(self, file, dsp, title, params):
         if dsp is None:
@@ -630,7 +882,7 @@ class Graph:
             self.connect("pc_midi", 0, dev_id, 0)
         return dev_id
 
-    def set_param(self, dev_id, name, value):
+    def set_param(self, dev_id, name, value, _reapply=False):
         import scope_device as sd
         n = self.node(dev_id)
         if n.kind != "device":
@@ -641,16 +893,67 @@ class Graph:
         value = float(value)
         switched = False
         rows = self._builtin_raw(q, value) if "b" in q else sd.targets_raw(q, value, self.rate)
-        for key, inp, raw in rows:
-            if inp == "switch":
+        todo = list(rows)
+        while todo:
+            key, inp, raw = todo.pop(0)
+            if inp == "switch":                  # routing switch position or structure knob (re-plan)
                 if n.dev["switch_values"].get(key) != raw:
                     n.dev["switch_values"][key] = raw
                     switched = True
+            elif inp == "host":                  # emulated host script input (Pan, Ch1632X ...)
+                todo += sd.host_func_update(n.dev.get("host_funcs") or [], key, raw[0], raw[1], self.rate)
             elif key in n.dev["inner"]:
                 self.set_value(n.dev["inner"][key], inp, raw)
+        n.dev["params"][name] = value
+        if not _reapply:
+            n.dev.setdefault("user_params", set()).add(name)
         if switched:
             self._replan(n)
-        n.dev["params"][name] = value
+
+    def meter_map(self, n):
+        """The device's SCOPE VU meters (vumulti*.dsp): [(inner key, meter j, strip, side)]. Meter j measures VU input
+        3+2j; its level is async output 3j (1.31, decaying peak). A source that is the target of input port
+        In<n>/IR<n> belongs to strip Ch<n> (L/R), a source under .../Master/... to the master strip."""
+        p = n.dev["plan"]
+        cache = n.dev.get("_meters")
+        if cache is not None and cache[0] is p:
+            return cache[1]
+        vus = {m["key"] for m in p["modules"] if (m.get("dsp_file") or "").lower().startswith("vumulti")}
+        by_src = {}
+        for q in p["ports"]:
+            m = re.match(r"(In|IR|Ax)(\d+)$", q["name"]) if q["dir"] == "in" else None
+            for t in q.get("targets") or []:
+                if m:
+                    strip = ("Ax" if m.group(1) == "Ax" else "Ch") + m.group(2)
+                    by_src[t[0]] = (strip, "R" if m.group(1) == "IR" else "L")
+        out, master = [], 0
+        for w in sorted(p["wires"], key=lambda w: (w["dst_key"], w["in"])):
+            if w["dst_key"] not in vus or w["in"] < 3 or (w["in"] - 3) % 2 or w["dst_key"] not in n.dev["inner"]:
+                continue
+            j = (w["in"] - 3) // 2
+            if w["src_key"] in by_src:
+                strip, side = by_src[w["src_key"]]
+            elif "/Master/" in w["src_key"] and "Folded" not in w["src_key"] and "Aux" not in w["src_key"]:
+                strip, side = "Master", "LR"[master % 2]
+                master += 1
+            else:
+                continue
+            out.append((w["dst_key"], j, strip, side))
+        n.dev["_meters"] = (p, out)
+        return out
+
+    def meters(self, dev_id):
+        """Current levels of the device's VU meters in dBFS (None = silence)."""
+        n = self.node(dev_id)
+        if n.kind != "device":
+            raise GraphError("%s is not a device" % dev_id)
+        res = []
+        for key, j, strip, side in self.meter_map(n):
+            mod = self.nodes[n.dev["inner"][key]].mod
+            v = self.b.get_value(mod.dsp, mod.seg_mod + mod.cls.off_async_out(3 * j))
+            db = None if v <= 0 or v >= 0x80000000 else round(20 * math.log10(v / 2147483648.0), 1)
+            res.append({"strip": strip, "side": side, "db": db})
+        return res
 
     def peek(self, req):
         """Debug: read DSP words. {dsp, addr, count} or {id, [key], pad: in|ao|so, index, [count]}; for inputs also the
@@ -709,19 +1012,75 @@ class Graph:
         return {"name": r.get("name"), "warnings": r.get("check", [])}
 
     def _replan(self, n):
-        """A routing switch moved: apply the internal wire diff, then re-link the device's ports."""
+        """A routing switch, a structure control or a pad connection changed: re-plan the device and apply the
+        difference (modules that got / lost their voices, SetVoices, internal wires, constants of new modules,
+        port links, emulated host scripts), then re-send the parameters the user set.  If that fails (no DSP
+        room), the change is undone by rebuilding the device from the previous switch values."""
+        try:
+            try:
+                self._replan_diff(n)
+            except _NeedRebuild:
+                self._rebuild(n)
+            n.dev["applied"] = dict(n.dev["switch_values"])
+        except Exception as e:
+            n.dev["switch_values"] = dict(n.dev.get("applied") or {})
+            try:
+                self._rebuild(n)
+            except Exception as e2:
+                raise GraphError("%s: %s; restoring the device failed too (%s), remove it" % (n.id, e, e2))
+            raise GraphError("%s: change undone: %s" % (n.id, e))
+
+    def _replan_diff(self, n):
         import scope_device as sd
         old = n.dev["plan"]
         new = self._plan(n.dev["path"], n.dev["switch_values"])
         inner = n.dev["inner"]
+        new_mods = {m["key"]: m for m in new["modules"]}
+        removed = [k for k in reversed(old["order"]) if k in inner and k not in new_mods]
+        added = [k for k in new["order"] if k in new_mods and k not in inner]
+        if any(new_mods[k].get("kind") == "pc_delay" for k in added) or \
+                any(self.nodes[inner[k]].kind == "pc_delay" for k in removed):
+            raise GraphError("%s: host delay lines cannot change at run time" % n.id)
+        # modules that lost their voices: silence their readers (inside and outside the device), unload
+        gone = set(removed)
+        for (d, i), (s_, o) in list(self.wires.items()):
+            if s_ == n.id:
+                ep = self._src_ep(s_, o)
+                if ep is not None and ep[0] in {inner[k] for k in gone}:
+                    for dn, ii in self._dst_eps(d, i):
+                        self._link(None, dn, ii)
+        for w in old["wires"]:
+            if w["src_key"] in gone and w["dst_key"] in inner and w["dst_key"] not in gone:
+                self._link(None, inner[w["dst_key"]], w["in"])
+        for k in removed:
+            self.unload(inner.pop(k), _inner=True)
+        # modules that got voices
+        if added:
+            place = self._place(new, [new_mods[k] for k in added], None, new["name"], prefer=n.dev.get("dsps"),
+                                grow=True)
+            for k in added:
+                nid = self.load(new_mods[k]["dsp_file"], place[k], k.split("/")[-1])
+                self.nodes[nid].parent = n.id
+                inner[k] = nid
+        ov = {x["key"]: x["voices"] for x in old.get("set_voices") or []}
+        self._set_voices(new, inner, only={x["key"] for x in new.get("set_voices") or []
+                                           if x["key"] in added or ov.get(x["key"]) != x["voices"]})
         disc, conn = sd.rewire(old, new)
         for dk, i in disc:
-            if dk in inner:
+            if dk in inner and dk not in added:
                 self._link(None, inner[dk], i)
         for w in conn:
             self._link((inner[w["src_key"]], w["out"]), inner[w["dst_key"]], w["in"])
+        oc = {(c["key"], c["in"]): sd.const_raw(c, self.rate) for c in old["consts"]}
+        for c in new["consts"]:
+            raw = sd.const_raw(c, self.rate)
+            if c["key"] in added or oc.get((c["key"], c["in"])) != raw:
+                self.set_value(inner[c["key"]], c["in"], raw)
         old_t = {q["name"]: q.get("targets") or [] for q in old["ports"] if q["dir"] == "in"}
         n.dev["plan"] = new
+        n.dev["params_list"] = self._params_list(new)
+        n.dev["host_funcs"] = self._host_funcs(new)
+        n.dev["dsps"] = sorted({self.nodes[x].dsp for x in inner.values() if self.nodes[x].dsp is not None})
         for k, name in enumerate(n.dev["in_names"]):
             new_t = next((q.get("targets") or [] for q in new["ports"] if q["dir"] == "in" and q["name"] == name), [])
             for key, i in old_t.get(name, []):
@@ -731,7 +1090,27 @@ class Graph:
             ep = self._src_ep(*w) if w else None
             for key, i in new_t:
                 self._link(ep, inner[key], i)
+        self._push_host_funcs(n)
+        for name in sorted(n.dev.get("user_params") or ()):
+            if name in n.dev["params"] and any(q["name"] == name for q in n.dev["params_list"]):
+                self.set_param(n.id, name, n.dev["params"][name], _reapply=True)
         self._refresh_from(n.id)
+
+    def _restructure(self, nid):
+        """Dynamic devices (factory mixers): a channel exists while one of its pads is connected (RouteByContext
+        'Connected' -> DynVoicesOfParent); re-plan when the set of connected dynamic pads changed."""
+        n = self.nodes.get(nid)
+        if n is None or n.kind != "device" or not n.dev["plan"].get("dynamic_ports") or n.dev.get("unloading") \
+                or self._bulk:
+            return
+        dyn = set(n.dev["plan"]["dynamic_ports"])
+        conn = {n.dev["in_names"][i] for (d, i) in self.wires if d == nid and i < len(n.dev["in_names"])}
+        conn |= {n.dev["out_names"][o] for (_, _), (s_, o) in self.wires.items()
+                 if s_ == nid and o < len(n.dev["out_names"])}
+        conn = sorted(conn & dyn)
+        if n.dev["switch_values"].get("@connected") != conn:
+            n.dev["switch_values"]["@connected"] = conn
+            self._replan(n)
 
     def devices(self, refresh=False):
         ok = [d for d in self._scope_devices(refresh)
@@ -742,7 +1121,7 @@ class Graph:
         """Usable SCOPE devices (complete plan, no MIDI), cached; devices() drops the ones the licence does not cover."""
         if self._devices is not None and not refresh:
             return self._devices_usable()
-        cache = "/var/cache/pulsard/devices-v3.json"
+        cache = "/var/cache/pulsard/devices-v4.json"
         if not refresh and os.path.exists(cache):
             try:
                 with open(cache) as f:
@@ -845,7 +1224,12 @@ class Graph:
     def export_project(self):
         mods = [{"id": n.id, "file": n.mod.cls.name, "dsp": n.dsp, "title": n.title}
                 for n in self.nodes.values() if n.kind == "module" and not n.fixed and n.parent is None]
-        mods += [{"id": n.id, "device": n.dev["file"], "dsp": n.dsp, "title": n.title, "params": n.dev["params"]}
+        mods += [dict({"id": n.id, "device": n.dev["file"], "title": n.title, "params": n.dev["params"],
+                       # dynamic / multi-DSP devices are placed again when they are rebuilt
+                       "dsp": None if n.dev["plan"].get("dynamic_ports") or len(n.dev.get("dsps") or ()) > 1
+                       else n.dsp},
+                      **({"structure": {"@connected": n.dev["switch_values"]["@connected"]}}
+                         if n.dev["switch_values"].get("@connected") else {}))
                  for n in self.nodes.values() if n.kind == "device"]
         wires = [{"src": s, "out": o, "dst": d, "in": i} for (d, i), (s, o) in self.wires.items()
                  if self.default_wires.get((d, i)) != (s, o)]
@@ -873,12 +1257,33 @@ class Graph:
         for m in prj.get("modules", []):
             try:
                 if "device" in m:
-                    ids[m["id"]] = self.load_device(m["device"], m.get("dsp"), m.get("title"), m.get("params"))
+                    ids[m["id"]] = self.load_device(m["device"], m.get("dsp"), m.get("title"), m.get("params"),
+                                                    m.get("structure"))
                 else:
                     ids[m["id"]] = self.load(m["file"], m.get("dsp"), m.get("title"))
             except Exception as e:                           # keep going: report what could not be restored
                 errors.append("module %s (%s): %s" % (m.get("title"), m.get("file") or m.get("device"), e))
         mapped = lambda nid: ids.get(nid, nid)
+        self._bulk = True
+        try:
+            self._import_wires(prj, mapped, errors)
+        finally:
+            self._bulk = False
+        for nid in list(ids.values()):
+            try:
+                self._restructure(nid)
+            except Exception as e:
+                errors.append("device %s: %s" % (nid, e))
+        for v in prj.get("values", []):
+            try:
+                self.set_value(mapped(v["id"]), int(v["in"]), int(v["value"]))
+            except Exception as e:
+                errors.append("value %s.%s: %s" % (v.get("id"), v.get("in"), e))
+        gui = prj.get("gui") or {}
+        self.gui = dict(gui, layout={mapped(k): v for k, v in (gui.get("layout") or {}).items()})
+        return {"ids": ids, "errors": errors}
+
+    def _import_wires(self, prj, mapped, errors):
         for r in prj.get("removed", []):
             try:
                 self.disconnect(mapped(r["dst"]), int(r["in"]))
@@ -889,14 +1294,6 @@ class Graph:
                 self.connect(mapped(w["src"]), int(w["out"]), mapped(w["dst"]), int(w["in"]))
             except Exception as e:
                 errors.append("wire %s.%s -> %s.%s: %s" % (w.get("src"), w.get("out"), w.get("dst"), w.get("in"), e))
-        for v in prj.get("values", []):
-            try:
-                self.set_value(mapped(v["id"]), int(v["in"]), int(v["value"]))
-            except Exception as e:
-                errors.append("value %s.%s: %s" % (v.get("id"), v.get("in"), e))
-        gui = prj.get("gui") or {}
-        self.gui = dict(gui, layout={mapped(k): v for k, v in (gui.get("layout") or {}).items()})
-        return {"ids": ids, "errors": errors}
 
     def autosave(self):
         if not self.state_file:
@@ -946,7 +1343,10 @@ class Handler(socketserver.StreamRequestHandler):
                         g.set_value(req["id"], int(req["in"]), int(req["value"]))
                         res = {}
                     elif cmd == "load_device":
-                        res = {"id": g.load_device(req["file"], req.get("dsp"), req.get("name"), req.get("params"))}
+                        res = {"id": g.load_device(req["file"], req.get("dsp"), req.get("name"), req.get("params"),
+                                                   req.get("structure"))}
+                    elif cmd == "meters":
+                        res = {"meters": g.meters(req["id"])}
                     elif cmd == "peek":
                         res = {"words": g.peek(req)}
                     elif cmd == "presets":

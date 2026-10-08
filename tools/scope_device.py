@@ -77,7 +77,8 @@ GUI_PEPS = {"Equalizer", "SurfaceInterface", "ParentTopChanger", "SimpleChildren
             "LEDTimerTh", "SimpleAnimation", "ComboBox", "ComboBoxList", "TextFaderEx", "Controls@PresetList",
             "PresetListLoader", "SchubladeQuick", "MonoPadHide", "AuxPadHide", "AuxPadHideRM", "GetParent",
             "MenuFileEntry", "FileDialog", "RouteByContext", "EffectInsert", "ControllerHolder", "MRC",
-            "MasterVerbRevCurve", "Controls@VUMultiTranslate", "Controls@DiscreteValueDisplay", "ValueSender"}
+            "MasterVerbRevCurve", "Controls@VUMultiTranslate", "Controls@DiscreteValueDisplay", "ValueSender",
+            "DynamixPadHide", "MiniMixPadHide", "STM1632PadHide", "DirectOutsPadHide", "DeviceText"}
 # host converters emulated by converter_steps()
 CONVERTER_PEPS = {"Long2LongSyncAtom", "Long2LongSync", "Long2Long", "Double2Long", "Float2Long",
                   "LongAtom2LongSyncAtom", "LongSyncAtom2LongAtom", "Attenuator", "Long2Flt", "Inverter",
@@ -85,6 +86,12 @@ CONVERTER_PEPS = {"Long2LongSyncAtom", "Long2LongSync", "Long2Long", "Double2Lon
 POLY_PEPS = {"DynVoicesOfParent", "NumVoicesOfParent"}
 
 POLY_FLAG = 0x00400000          # module flags: polyphonic, 'VoiceDef' substitution (module_loading.md §1.2)
+# atoms that are Sim2k host objects, not DSP code: no DSP module is loaded for them (docs/device_format.md §9)
+HOST_ATOMS = {"Compensate Delay Linker": "Sim2k compensate_delay_link_module: sets the delayLen words of the "
+                                         "CompDel modules from the path latencies; Linux leaves them at 0"}
+# host scripts emulated by Device._eval_logic (they decide the voice counts of dynamic mixers)
+LOGIC_PEPS = {"If", "Or", "And", "Not", "MaxOf2"}
+MIDI_CONTROL_PREFIXES = ("M_C_",)   # MIDI controller modules (M_C_MOD channel filter, M_C_IO7 CC in/out)
 ONE_PER_BOARD = 0x20000000
 
 
@@ -256,6 +263,10 @@ def targets_raw(param, display_value, rate=48000):
         v = apply_chain(t["chain"], val)
         if t.get("kind") == "switch":
             out.append((t["key"], "switch", int(round(v))))
+        elif t.get("kind") == "structure":          # knob Val override -> re-plan (voices, switches)
+            out.append((t["key"], "switch", int(round(v))))
+        elif t.get("kind") == "host":               # emulated host script input -> host_func_update()
+            out.append((t["script"], "host", (t["var"], v)))
         else:
             out.append((t["key"], t["in"], pad_encode(v, t["encoding"], t["unit"], rate)))
     return out
@@ -266,7 +277,7 @@ def to_raw(param, display_value, rate=48000, target=0):
     rate `rate`.  (A 'switch' target yields the new Switch position instead, see rewire().)"""
     rows = targets_raw(param, display_value, rate)
     if target == 0:
-        rows = [r for r in rows if r[1] != "switch"] or rows
+        rows = [r for r in rows if r[1] not in ("switch", "host")] or rows
     return rows[target][2]
 
 
@@ -385,8 +396,11 @@ class Device:
             if not sd.is_object_archive(plain):
                 raise sd.FormatError("not an object archive")
             _, root, _, _ = sd.parse_plain(plain)
-            _ROOTS.clear()
+            while len(_ROOTS) >= 4:             # a few parsed trees: pulsard re-plans dynamic mixers often
+                _ROOTS.pop(next(iter(_ROOTS)))
             _ROOTS[path] = root
+        else:
+            _ROOTS[path] = _ROOTS.pop(path)     # most recently used last
         self.root = root
         self.edges = []             # (id, id) from routings
         self.links = []             # (RODPad id, linked pad id)
@@ -402,25 +416,67 @@ class Device:
         self.uf = UF()
         self.ext = []               # root RODPads
         self.placement = []
+        self.modinfo = {}           # id(RODModule obj) -> {"key", "parent", "nv"}: numVoices attribute (0x1E)
+        self.atom_mod = {}          # atom key -> id(its RODModule obj)
+        self.dvop = {}              # DynVoicesOfParent script key -> id(the module whose voices it sets)
+        self.uniq = {}              # (id(parent obj), unique number) -> id(child obj)
+        self.layers = {}            # Layer key -> record (routing recorder states)
+        self.algo_mod = {}          # algo key -> id(its RODModule obj)
         self._walk(self.root, "", True)
-        self._switches(switch_values or {})
+        self._edges0 = list(self.edges)
+        sv = dict(switch_values or {})
+        # structure inputs (docs/device_format.md §9): "@connected" = device ports treated as connected
+        # (RouteByContext), "@channels" = channel count of a count-driven mixer, other non-switch keys = knob Val
+        self.structure = {k: sv.pop(k) for k in list(sv) if k.startswith("@")}
+        self.overrides = {k: sv.pop(k) for k in list(sv) if k in self.algos and "Switch" not in self.algos[k]["vars"]
+                          and self.algos[k]["pep"] != "Layer"}
+        self._build(sv)
+        self.logic = None
+        if self.structure or self.overrides:
+            self.logic = self._eval_logic()
+            auto = {}
+            for key, al in self.algos.items():
+                if key in self.switches and key not in sv:
+                    r = self.uf.find(al["vars"]["Switch"].f["id"])
+                    if r in self.logic and int(self.logic[r]) != self.switches[key]["value"]:
+                        auto[key] = int(self.logic[r])
+                if key in self.layers and key not in sv:
+                    r = self._var_net(al, "ActiveState")
+                    if r in self.logic and int(self.logic[r]) != self.layers[key]["value"]:
+                        auto[key] = int(self.logic[r])
+            if auto:
+                self.edges = list(self._edges0)
+                self.uf = UF()
+                self._build(dict(sv, **auto))
+
+    def _build(self, switch_values):
+        self._switches(switch_values)
+        self._layers(switch_values)
         for a, b in self.edges + self.links:
             self.uf.union(a, b)
         self._nets()
 
     # -- tree walk ---------------------------------------------------------------------------------------
-    def _walk(self, o, path, is_root=False):
+    def _walk(self, o, path, is_root=False, parent=None):
         name = o.f.get("name") or o.cls
         key = name if is_root else path + "/" + name
         while key in self.atoms or key in self.algos:
             key += "'"
         if o.f.get("id"):
             self.mod_by_id[o.f["id"]] = key
+        # numVoices (RODModule::ReadExtraChunk 0x102 -> attribute 0x1E + SetNumberOfVoices) [C]
+        mi = {"key": key, "parent": parent, "nv": None, "obj": o, "kids": []}
+        self.modinfo[id(o)] = mi
+        if parent is not None:
+            self.modinfo[parent]["kids"].append(id(o))
+            if o.f.get("index") is not None:      # GetUniqueNumber(): Layer pads are (unique number, pad index)
+                self.uniq[(parent, o.f["index"])] = id(o)
         for x in (o.f.get("extras_mod") or []):
             if x["key"].startswith("0x10f"):
                 self.placement += [dict(p, key=None) for p in x["val"] if isinstance(p, dict)]
-            if x["key"].startswith("0x102") and _num(x["val"]) > 1:
-                self.unsupported.append("polyphonic: %s has numVoices=%s (extras 0x102)" % (key, x["val"]))
+            if x["key"].startswith("0x102"):
+                nv = int(_num(x["val"], -1))
+                mi["nv"] = nv if nv >= 0 else None
         a = o.f.get("algo")
         if a is not None:
             vars_ = a.f.get("vars", [])
@@ -433,6 +489,7 @@ class Device:
                 outs = [v for v in vars_ if v.f.get("dir") == "out"]
                 self.atoms[key] = {"key": key, "module": a.f.get("module"), "id": o.f.get("id"),
                                    "ins": ins, "outs": outs, "obj": o}
+                self.atom_mod[key] = id(o)
                 for i, v in enumerate(ins):
                     self.pad_owner[v.f["id"]] = ("atom", key, "in", i)
                     self.pads[v.f["id"]] = v
@@ -444,6 +501,9 @@ class Device:
                     _SURFACE_KEYS.add(key)
                 self.algos[key] = {"key": key, "pep": a.f.get("pep") or a.f.get("name"),
                                    "vars": {_vname(v): v for v in vars_}, "obj": o}
+                self.algo_mod[key] = id(o)
+                if self.algos[key]["pep"] in POLY_PEPS and parent is not None:
+                    self.dvop[key] = parent        # GetParent() of the script = the module above it
                 for v in vars_:
                     if v.f.get("id"):
                         self.pad_owner[v.f["id"]] = ("algo", key, _vname(v))
@@ -461,7 +521,7 @@ class Device:
             elif k.cls == "<RefModule>":
                 self.unsupported.append("references another file: %s" % k.f.get("path"))
             elif k.cls.startswith("ROD") and k.cls not in ("RODParameter",):
-                self._walk(k, key)
+                self._walk(k, key, parent=id(o))
         for rt in o.f.get("routings", []):
             a_, b_ = rt.f.get("from"), rt.f.get("to")
             if a_ and b_ and len(a_) == 1 and len(b_) == 1:
@@ -528,6 +588,77 @@ class Device:
             r.pop("pad_ids")
         self.switches = sw
 
+    # -- routing recorders (Layer.pep, LayerState, LayerRouting) ------------------------------------------
+    def _module_pads(self, mid):
+        """Pad ids of a module in GetPad() order: an atom's or script's variables, else its RODPads."""
+        o = self.modinfo[mid]["obj"]
+        a = o.f.get("algo")
+        if a is not None:
+            return [v.f.get("id") for v in a.f.get("vars", [])]
+        return [k.f.get("id") for k in o.kids if k.cls == "RODPad"]
+
+    def _layer_pad(self, parent, num, pad):
+        mid = self.uniq.get((parent, int(_num(num, -1))))
+        if mid is None:
+            return None
+        pads = self._module_pads(mid)
+        pad = int(_num(pad, -1))
+        return pads[pad] if 0 <= pad < len(pads) else None
+
+    def _layers(self, override):
+        """Layer = routing recorder: its states hold routings between the member pads (unique number of a
+        sibling module + pad index).  OnActiveStateChanged removes the routings among the member pads and
+        restores those of the active state.  Like _switches(): the saved routing is dropped and redone from
+        ActiveState (or `override[key]`)."""
+        self.layers = {}
+        link = dict(self.links)
+
+        def deref(pid):
+            for _ in range(8):
+                if pid not in link:
+                    break
+                pid = link[pid]
+            return pid
+        for key, al in self.algos.items():
+            if al["pep"] != "Layer" or "ActiveState" not in al["vars"]:
+                continue
+            vs = al["vars"]
+            mid = self.algo_mod.get(key)
+            parent = self.modinfo[mid]["parent"] if mid is not None else None
+            if parent is None or int(_num(_pval(vs.get("IsActive")), 1)) == 0:
+                continue
+            items = lambda n: [it.get("value") for it in ((vs[n].f.get("param") or {}).get("items") or [])] \
+                if n in vs else []                                          # noqa: E731
+            members = {deref(p) for p in (self._layer_pad(parent, m, i) for m, i in
+                                          zip(items("ModuleNum"), items("PadNum"))) if p is not None}
+            states = []
+            for sid in self.modinfo[mid]["kids"]:
+                skey = self.modinfo[sid]["key"]
+                if self.algos.get(skey, {}).get("pep") != "LayerState":
+                    continue
+                rts = []
+                for rid in self.modinfo[sid]["kids"]:
+                    ra = self.algos.get(self.modinfo[rid]["key"])
+                    if ra is None or ra["pep"] != "LayerRouting":
+                        continue
+                    g = lambda n: _pval(ra["vars"][n]) if n in ra["vars"] else None   # noqa: E731
+                    p1 = self._layer_pad(parent, g("ModuleNum1"), g("PadNum1"))
+                    p2 = self._layer_pad(parent, g("ModuleNum2"), g("PadNum2"))
+                    if p1 is not None and p2 is not None:
+                        rts.append((p1, p2))
+                states.append(rts)
+            val = override.get(key, _pval(vs["ActiveState"]))
+            try:
+                val = int(round(float(val)))
+            except (TypeError, ValueError):
+                val = 0
+            if not members or not states:
+                continue
+            self.edges = [(a, b) for a, b in self.edges if not (deref(a) in members and deref(b) in members)]
+            if 0 <= val < len(states):
+                self.edges += states[val]
+            self.layers[key] = {"key": key, "value": val, "states": len(states), "members": len(members)}
+
     # -- nets ------------------------------------------------------------------------------------------
     def _nets(self):
         nets = {}
@@ -547,6 +678,120 @@ class Device:
 
     def net_of(self, pid):
         return self.nets.get(self.uf.find(pid))
+
+    # -- host logic: the scripts that decide how many voices (channels) a dynamic mixer instantiates -----
+    def _var_net(self, al, name):
+        v = al["vars"].get(name)
+        return self.uf.find(v.f["id"]) if v is not None and v.f.get("id") else None
+
+    def _eval_logic(self):
+        """Emulate the small host scripts between the panel / pad connections and the DynVoicesOfParent
+        scripts (If, Or, And, Not, MaxOf2 .pep; RouteByContext 'Connected' = the device pad PadName is
+        connected).  Fixpoint over the host nets; returns {net root: value}."""
+        val, fixed = {}, {}
+        for al in self.algos.values():
+            for n, v in al["vars"].items():
+                x = _pval(v)
+                if v.f.get("id") and isinstance(x, (int, float)):
+                    val.setdefault(self.uf.find(v.f["id"]), x)
+        for key, x in self.overrides.items():
+            r = self._var_net(self.algos[key], "Val")
+            if r is not None:
+                fixed[r] = x
+        conn = self.structure.get("@connected")
+        if conn is not None:
+            conn = set(conn)
+            for al in self.algos.values():
+                if al["pep"] == "RouteByContext" and "Connected" in al["vars"]:
+                    r = self._var_net(al, "Connected")
+                    if r is not None:
+                        fixed[r] = 1 if _pval(al["vars"].get("PadName")) in conn else 0
+        if "@channels" in self.structure:
+            for r in self.channel_count_nets():
+                fixed[r] = int(self.structure["@channels"])
+        val.update(fixed)
+
+        def g(al, n, d=0):
+            r = self._var_net(al, n)
+            if r is not None and r in val:
+                return val[r]
+            return _num(_pval(al["vars"][n]), d) if n in al["vars"] else d
+
+        def cond(c, a, b):
+            return (c == ">" and a > b) or (c == "<" and a < b) or (c == "!" and a != b) or (c == "=" and a == b)
+
+        for _ in range(64):
+            changed = False
+            for key, al in self.algos.items():
+                pep, vs = al["pep"], al["vars"]
+                if pep == "If" and "Out" in vs:
+                    c = str(_pval(vs.get("Condition")) if "Condition" in vs else "=").replace(" ", "")
+                    a, b = g(al, "In"), g(al, "ValIf", 1)
+                    ok = cond(c[:1], a, b) or cond(c[1:2], a, b)
+                    out = g(al, "ValYes", 1) if ok else g(al, "ValNo", 0)
+                elif pep == "Or" and "Out" in vs:
+                    out = 1 if (g(al, "In1") == 1 or g(al, "In2") == 1) else 0
+                elif pep == "And" and "Out" in vs:
+                    out = 1 if (g(al, "In1") != 0 and g(al, "In2") != 0) else 0
+                elif pep == "Not" and "Out" in vs:
+                    out = 1 if g(al, "In") == 0 else 0
+                elif pep == "MaxOf2" and "Out" in vs:
+                    out = max(g(al, "In1"), g(al, "In2"))
+                else:
+                    continue
+                r = self._var_net(al, "Out")
+                if r is None or r in fixed or val.get(r) == out:
+                    continue
+                val[r] = out
+                changed = True
+            if not changed:
+                break
+        return val
+
+    def channel_count_nets(self):
+        """Nets that carry the channel count of a count-driven dynamic mixer (MicroMixer: '@Select Channel' /
+        less / More drive the DynVoicesOfParent of the master adders and, through If '>' k-1, channel k)."""
+        out = []
+        for key, mid in self.dvop.items():
+            al = self.algos[key]
+            r = self._var_net(al, "Voices")
+            if r is None or r in out:
+                continue
+            akey = self.modinfo[mid]["key"]
+            n = self.nets.get(r) or {}
+            if akey in self.atoms and any(self.algos[hk]["pep"] == "If" and hv == "In" for hk, hv, _ in n.get("host", [])):
+                out.append(r)
+        return out
+
+    def voices_of_module(self, mid, dv_val=None):
+        """RODModule::GetNumberOfVoices: the nearest numVoices attribute >= 0 walking up, else the global
+        default 1 (CSet/voices).  DynVoicesOfParent scripts set their parent's attribute (-1 = inherit)."""
+        if dv_val is None:
+            dv_val = self._dvop_values()
+        while mid is not None:
+            mi = self.modinfo[mid]
+            nv = dv_val.get(mid, mi["nv"])
+            if nv is not None and nv >= 0:
+                return nv
+            mid = mi["parent"]
+        return 1
+
+    def _dvop_values(self):
+        dv_val = {}
+        for key, m in self.dvop.items():
+            al = self.algos[key]
+            if self.logic is not None:
+                r = self._var_net(al, "Voices")
+                v = self.logic.get(r, _pval(al["vars"].get("Voices")))
+            else:
+                v = _pval(al["vars"].get("Voices")) if "Voices" in al["vars"] else None
+            if isinstance(v, (int, float)):
+                dv_val[m] = int(v)
+        return dv_val
+
+    def atom_voices(self):
+        dv_val = self._dvop_values()
+        return {key: self.voices_of_module(mid, dv_val) for key, mid in self.atom_mod.items()}
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -605,6 +850,159 @@ def converter_steps(al, invar):
         other = "in2" if invar == "in1" else "in1"
         return [("out", [{"op": "scale", "k": _num(_pval(vs[other]), 1.0) if other in vs else 1.0}])]
     return _pc_delay_converter_steps(al, invar)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# multi-input host scripts of the factory mixers, emulated with live state in pulsard (docs/device_format.md §9)
+# ---------------------------------------------------------------------------------------------------------
+
+def _c_int(x):
+    """C (double -> int) assignment: truncation toward zero, 32-bit wrap."""
+    v = int(math.trunc(x)) & 0xFFFFFFFF
+    return v - (1 << 32) if v & 0x80000000 else v
+
+
+def _f32(x):
+    """pep 'float' variables are IEEE single precision (Pan.pep pivier: the saved L/R words match only so)."""
+    return struct.unpack("<f", struct.pack("<f", float(x)))[0]
+
+
+_PI4 = _f32(0.7853981633974)
+_PI2 = _f32(1.570796326795)
+
+
+def _pan_lr(pan, mono, mode):
+    """Pan.pep / Ch1632X.pep OnPanChanged: Mono 1 = mono source panned (Mode 0 = 3 dB sin law, 1 = linear),
+    Mono 0 = stereo balance."""
+    pan = int(pan)
+    if int(mono) == 1:
+        if pan >= 1073741824:
+            panb = _c_int(2.0 * (pan - 1073741824.0))
+        else:
+            panb = _c_int(-2.0 * (1073741824.0 - pan))
+        if int(mode) == 0:
+            panf = _f32(panb / float(0x7FFFFFFF))
+            return (_c_int(math.sin(_PI4 * (1.0 - panf)) * 2147483647.5),
+                    _c_int(math.sin(_PI4 * (1.0 + panf)) * 2147483647.5))
+        return 2147483647 - pan, pan
+    if pan == 1073741824:
+        return 2147483647, 2147483647
+    if pan < 1073741824:
+        return 2147483647, _c_int(2147483647 - (2147483647 - 2 * pan))
+    left = _c_int(-2 * pan)
+    return (0 if left == 2 else left), 2147483647
+
+
+def _hf_pan(v):
+    left, right = _pan_lr(v["Pan"], v["Mono"], v["Mode"])
+    return {"L": left, "R": right}
+
+
+def _hf_invert_gain(v):
+    return {"Out": _c_int(-v["Val"]) if int(v["Invert"]) != 0 else _c_int(v["Val"])}
+
+
+def _hf_ch1632(v):
+    """Ch1632X.pep: channel gains of STM 1632 (Master L/R gains MixL/MixR, aux send gains Asd1..4)."""
+    mute, mono, fader = int(v["Mute"]), int(v["Mono"]), float(v["Fader"])
+    if mute == 1:
+        left, right = _pan_lr(v["Pan"], mono, v["Mode"])
+    else:
+        left, right = 0, 0
+    out = {"L": left, "R": right}
+    if int(v["Mix"]) == 1:
+        out["MixL"], out["MixR"] = _c_int(fader * left / 2147483647.0), _c_int(fader * right / 2147483647.0)
+    else:
+        out["MixL"] = out["MixR"] = 0
+    for k in range(1, 5):
+        if mute != 1:
+            a = 0
+        else:
+            a = _c_int(v["AxF%d" % k] * fader / 2147483647.0) if int(v["Pre%d" % k]) == 0 else \
+                _c_int(v["AxF%d" % k] / 4.0)
+            if mono == 1:
+                a = int(a / 2)
+        out["Asd%d" % k] = a
+    return out
+
+
+def _hf_surround16(v):
+    """SurroundpanSTM16.pep: surround panner of an STM 16 S channel (PLR/PFB in -1..1, IDiv = divergence)."""
+    plr, pfb, idiv, fader = _f32(v["PLR"]), _f32(v["PFB"]), float(v["IDiv"]), float(v["Fader"])
+    ms = float(v["Mute"]) * float(v["SoSw"])
+    s = math.sin
+    out = {"FroL": _c_int(s(_PI4 * (1 - plr)) * s(_PI4 * (1 + pfb)) * idiv),
+           "FroR": _c_int(s(_PI4 * (1 + plr)) * s(_PI4 * (1 + pfb)) * idiv),
+           "ReaL": _c_int(s(_PI4 * (1 - plr)) * s(_PI4 * (1 - pfb)) * idiv),
+           "ReaR": _c_int(s(_PI4 * (1 + plr)) * s(_PI4 * (1 - pfb)) * idiv),
+           "Cent": _c_int(math.cos(_PI2 * (-plr)) * s(_PI4 * (1 + pfb)) * (2147483648.0 - idiv))}
+    for o, sel in (("FroL", "L"), ("FroR", "R"), ("ReaL", "Ls"), ("ReaR", "Rs"), ("Cent", "C")):
+        out[o] = _c_int(out[o] * fader / 2147483647.0 * float(v[sel]) * ms)
+    out["LFE"] = _c_int(float(v["LFEP"]) * fader / 2147483647.0 * ms)
+    for k in range(1, 5):
+        if int(v["Pre%d" % k]) == 0:
+            out["Asd%d" % k] = _c_int(float(v["AxF%d" % k]) * fader / 2147483647.0 * ms)
+        else:
+            out["Asd%d" % k] = _c_int(float(v["AxF%d" % k]) / 4.0 * ms)
+    return out
+
+
+def _hf_attenuator(v):
+    """Attenuator.pep with a variable factor: Out = In * Attenuator / 0x7fffffff * Factor (clipped)."""
+    out = _c_int(float(v["In"]) * float(v["Attenuator"]) / INTMAX)
+    f = float(v.get("Factor", 1.0))
+    return {"Out": INTMAX if out * f > INTMAX else _c_int(out * f)}
+
+
+HOST_FUNCS = {
+    "Pan": {"in": ["Pan", "Mono", "Mode"], "out": ["L", "R"], "fn": _hf_pan},
+    "Attenuator": {"in": ["In", "Attenuator", "Factor"], "out": ["Out"], "fn": _hf_attenuator,
+                   "defaults": {"Factor": 1.0, "Attenuator": INTMAX}},
+    "ValToInvertGain": {"in": ["Val", "Invert"], "out": ["Out"], "fn": _hf_invert_gain},
+    "Ch1632X": {"in": ["Mix", "AxF1", "AxF2", "AxF3", "AxF4", "Pre1", "Pre2", "Pre3", "Pre4", "Fader", "Pan",
+                       "Mono", "Mode", "Mute"],
+                "out": ["MixL", "MixR", "Asd1", "Asd2", "Asd3", "Asd4", "L", "R"], "fn": _hf_ch1632},
+    "SurroundpanSTM16": {"in": ["PLR", "PFB", "IDiv", "LFEP", "AxF1", "AxF2", "AxF3", "AxF4", "Pre1", "Pre2",
+                                "Pre3", "Pre4", "Fader", "Mute", "SoSw", "L", "R", "Ls", "Rs", "C"],
+                         "out": ["FroL", "FroR", "Cent", "ReaL", "ReaR", "LFE", "Asd1", "Asd2", "Asd3", "Asd4"],
+                         "fn": _hf_surround16},
+}
+
+
+def host_func_outputs(hf, rate=48000):
+    """[(key, in, raw)] for every DSP pad an emulated host script (plan["host_funcs"] entry, live "state")
+    drives; nested host-script targets are evaluated too (one level is all the mixers use)."""
+    spec = HOST_FUNCS[hf["pep"]]
+    out = spec["fn"](hf["state"])
+    rows = []
+    for var, tg in hf["outputs"].items():
+        if var not in out:
+            continue
+        for t in tg:
+            v = apply_chain(t.get("chain") or [], out[var])
+            if t.get("kind") == "switch":
+                rows.append((t["key"], "switch", int(round(v))))
+            elif t.get("kind") == "host":
+                rows.append((t["script"], "host", (t["var"], v)))
+            elif not t.get("kind"):
+                rows.append((t["key"], t["in"], pad_encode(v, t["encoding"], t["unit"], rate)))
+    return rows
+
+
+def host_func_update(host_funcs, script, var, value, rate=48000, depth=0):
+    """Set input `var` of the emulated host script `script` (live state in host_funcs) and return the DSP
+    writes [(key, in, raw)] (and routing switch moves (key, "switch", pos)) it causes."""
+    hf = next((x for x in host_funcs if x["key"] == script), None)
+    if hf is None or depth > 4:
+        return []
+    hf["state"][var] = float(value)
+    rows = []
+    for r in host_func_outputs(hf, rate):
+        if r[1] == "host":
+            rows += host_func_update(host_funcs, r[0], r[2][0], r[2][1], rate, depth + 1)
+        else:
+            rows.append(r)
+    return rows
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -703,36 +1101,57 @@ def _unit_of(rocpad, cls_pad):
 
 def plan(dev_path, dsp_dir=DEFAULT_DSP_DIR, switch_values=None):
     """Load plan of a .dev.  switch_values = {switch key: value} recomputes the wiring for other positions
-    of the routing switches (see rewire())."""
+    of the routing switches (see rewire()); keys starting with '@' and knob keys are structure inputs of
+    dynamic devices (docs/device_format.md §9: '@connected' = connected device ports, '@channels')."""
     dv = Device(dev_path, dsp_dir, switch_values)
     res = {"name": dv.root.f.get("name"), "file": os.path.basename(dev_path), "modules": [], "wires": [],
            "ports": [], "consts": [], "params": [], "unmapped_params": [], "switches": list(dv.switches.values()),
-           "needs_midi": False, "unsupported": dv.unsupported, "warnings": dv.warnings}
+           "needs_midi": False, "unsupported": dv.unsupported, "warnings": dv.warnings,
+           "set_voices": [], "host_atoms": [], "dropped": []}
     mods = {}
+    voices = dv.atom_voices()
+    dropped = set()
     for key, at in dv.atoms.items():
+        nv = voices.get(key, 1)
+        name = (at["module"] or "").strip()
+        problems = []
         fn = resolve_atom(at["module"], dsp_dir)
         m = {"key": key, "atom": at["module"], "dsp_file": fn, "fixed_dsp": None, "same_dsp_group": None,
-             "cycles": None, "placement": None}
+             "cycles": None, "placement": None, "voices": nv}
+        if name in HOST_ATOMS:
+            res["host_atoms"].append({"key": key, "atom": name, "what": HOST_ATOMS[name]})
+            dropped.add(key)
+            continue
         if fn is None and _pc_delay_module(m, at):
             pass
         elif fn is None:
-            dv.unsupported.append("no DSP file for atom %r (%s) - host/PC-side or other-board module"
-                                  % (at["module"], key))
+            problems.append("no DSP file for atom %r (%s) - host/PC-side or other-board module" % (at["module"], key))
         else:
             c = module_class(dsp_dir, fn)
             if isinstance(c, Exception):
-                dv.unsupported.append("%s: %s" % (fn, c))
+                problems.append("%s: %s" % (fn, c))
             else:
                 at["cls"] = c
                 fx = (c.flags >> 17) & 0xF
                 m["fixed_dsp"] = fx - 1 if fx not in (0, 0xF) else None
-                m["cycles"] = c.syncCycles
+                m["cycles"] = c.syncCycles & 0xFFFF
                 if c.flags & POLY_FLAG:
-                    dv.unsupported.append("polyphonic DSP module %s (%s)" % (fn, key))
+                    nmax = _max_voices(c)
+                    if voice_layout(c) is None and c.flags & SINGLE_ATOM and nmax:
+                        # single atom, no voice arrays (32ADD, 16ADD...): ChangeVoices -> pSetVoices(module, n);
+                        # the unrolled sum then covers inputs 1..n [C]
+                        m["voices"] = min(nv, nmax)
+                        m["cycles"] = voice_cycles(c.syncCycles, m["voices"])
+                        if nv > 0:
+                            res["set_voices"].append({"key": key, "voices": m["voices"]})
+                    else:
+                        problems.append("polyphonic DSP module %s (%s)" % (fn, key))
+                elif nv > 1 and not (c.flags & SINGLE_ATOM):
+                    problems.append("polyphonic: %s has %d voices (one instance per voice not handled)" % (key, nv))
                 cin = [p for p in c.pads if p.kind == "in"]
                 cout = [p for p in c.pads if p.kind != "in"]
                 if len(cin) != len(at["ins"]) or len(cout) != len(at["outs"]):
-                    dv.unsupported.append("%s: pad count differs from %s (%d/%d in, %d/%d out)" % (
+                    problems.append("%s: pad count differs from %s (%d/%d in, %d/%d out)" % (
                         key, fn, len(at["ins"]), len(cin), len(at["outs"]), len(cout)))
                 else:
                     for lst, cl in ((at["ins"], cin), (at["outs"], cout)):
@@ -743,8 +1162,39 @@ def plan(dev_path, dsp_dir=DEFAULT_DSP_DIR, switch_values=None):
                 for p in c.pads:
                     if (p.type & 0xF) == 0xE:
                         at["midi"] = True
+        if nv <= 0:
+            dropped.add(key)                 # 0 voices: SCOPE does not instantiate the atom (ChangeVoices(0))
+            continue
+        dv.unsupported += problems
         mods[key] = m
         res["modules"].append(m)
+    res["dropped"] = sorted(dropped - {h["key"] for h in res["host_atoms"]})
+    def gain_src(key, i):
+        """Strip of a bus adder's per-input gain pad G<n> (32ADD): what feeds its input In<n>."""
+        at = dv.atoms.get(key)
+        cin = at.get("cin") if at else None
+        m = re.fullmatch(r"G(\d+)", cin[i].short or "") if cin and i < len(cin) else None
+        if m is None:
+            return None
+        j = next((k for k, p in enumerate(cin) if re.fullmatch(r"In0*%d" % int(m.group(1)), p.short or "")), None)
+        if j is None or j >= len(at["ins"]) or not at["ins"][j].f.get("id"):
+            return None
+        n = dv.net_of(at["ins"][j].f["id"]) or {}
+        for e in n.get("ext", []):
+            mm = re.fullmatch(r"(Ax|In|I|IL)?(\d+)", e.f.get("name") or "")
+            if mm:
+                return "%s%d" % ("Ax" if mm.group(1) == "Ax" else "Ch", int(mm.group(2)))
+        for sk, _, _ in n.get("dsp_out", []):
+            return _strip_from_key(sk)
+        return None
+    # Attenuators whose factor comes from another script (MicroMixer: Pan L/R -> Attenuator) are emulated
+    # with live state like the Pan scripts; plain ones stay chain steps (converter_steps)
+    dyn_att = set()
+    for hk, h in dv.algos.items():
+        if h["pep"] == "Attenuator":
+            r = dv._var_net(h, "Attenuator")
+            if r is not None and any(k != hk for k, _, _ in (dv.nets.get(r) or {}).get("host", [])):
+                dyn_att.add(hk)
     for p in dv.placement:
         key = dv.mod_by_id.get(int(p["module"].split(".")[-1], 16)) if p.get("module") else None
         if key in mods and p.get("dsp") and p["dsp"] != [-1]:
@@ -763,8 +1213,11 @@ def plan(dev_path, dsp_dir=DEFAULT_DSP_DIR, switch_values=None):
         lst = at.get("cin" if d == "in" else "cout")
         return lst[i] if lst and i < len(lst) else None
 
-    # wires, constants, ports
-    for r, n in dv.nets.items():
+    # wires, constants, ports (ports come from the whole device so that their list does not change with the
+    # voice counts; pads of atoms with 0 voices are left out of the wires/targets)
+    for r, n0 in dv.nets.items():
+        n = dict(n0, dsp_in=[x for x in n0["dsp_in"] if x[0] not in dropped],
+                 dsp_out=[x for x in n0["dsp_out"] if x[0] not in dropped])
         if len(n["dsp_out"]) > 1:
             dv.unsupported.append("net with %d DSP outputs: %s" % (
                 len(n["dsp_out"]), ", ".join("%s.%d" % (k, o) for k, o, _ in n["dsp_out"])))
@@ -774,28 +1227,28 @@ def plan(dev_path, dsp_dir=DEFAULT_DSP_DIR, switch_values=None):
             for dk, di, _ in n["dsp_in"]:
                 res["wires"].append({"src_key": sk, "out": so, "dst_key": dk, "in": di})
         for e in n["ext"]:
-            if not (n["dsp_in"] or n["dsp_out"] or len(n["ext"]) > 1):
+            if not (n0["dsp_in"] or n0["dsp_out"] or len(n["ext"]) > 1):
                 continue
             # RODPad padbyte: 0 = pad drawn on the input (left) side, 2 = output (right) side [L]
             side = "out" if e.f.get("padbyte") == 2 else "in"
-            pdir = "out" if n["dsp_out"] else ("in" if n["dsp_in"] else side)
+            pdir = "out" if n0["dsp_out"] else ("in" if n0["dsp_in"] else side)
             tgt = [[k, i] for k, i, _ in (n["dsp_out"] if pdir == "out" else n["dsp_in"])]
-            pads = [dv.pads[pid] for _, _, pid in (n["dsp_out"] or n["dsp_in"])]
+            all_t = [(k, i) for k, i, _ in (n0["dsp_out"] if pdir == "out" else n0["dsp_in"])]
+            pads = [dv.pads[pid] for _, _, pid in (n0["dsp_out"] or n0["dsp_in"])]
             sync = any(_attrs(v).get("Sync") for v in pads)
             midi = any(_ptype(v) == "MIDI" for v in pads) or any(
-                (cpad(k, pdir, i) is not None and (cpad(k, pdir, i).type & 0xF) == 0xE) for k, i in tgt)
+                (cpad(k, pdir, i) is not None and (cpad(k, pdir, i).type & 0xF) == 0xE) for k, i in all_t)
             port = {"name": e.f.get("name"), "dir": pdir, "sync": bool(sync), "midi": midi,
                     "target": tgt[0] if tgt else None, "targets": tgt}
             others = [x.f.get("name") for x in n["ext"] if x is not e]
             if others and side != pdir:
                 port["dir"] = side
-            if others and not n["dsp_out"] and side == "out":
+            if others and not n0["dsp_out"] and side == "out":
                 port["passthrough_from"] = others      # e.g. a bypassed effect: Out is wired to In
                 port["targets"], port["target"] = [], None
             res["ports"].append(port)
             if midi:
-                res["needs_midi"] = True
-                dv.warnings.append("MIDI port %r: pulsard has no MIDI routing yet" % e.f.get("name"))
+                res.setdefault("midi_ports", []).append(e.f.get("name"))
         if not n["dsp_out"]:
             for dk, di, pid in n["dsp_in"]:
                 v = dv.pads[pid]
@@ -809,20 +1262,34 @@ def plan(dev_path, dsp_dir=DEFAULT_DSP_DIR, switch_values=None):
                                           "encoding": _encoding(cp, v, unit)})
 
     # parameters: every knob/fader/button net, followed through converters to DSP inputs
-    seen_nets = set()
-    for key, al in dv.algos.items():
-        pep = al["pep"]
-        if pep not in KNOB_PEPS and pep not in BUTTON_PEPS:
-            continue
-        vv = al["vars"].get("Val")
-        if vv is None or not vv.f.get("id"):
-            continue
-        r0 = dv.uf.find(vv.f["id"])
-        if r0 in seen_nets:
-            continue
-        seen_nets.add(r0)
+    def logic_reach(r0, limit=200):
+        """Keys of the DynVoicesOfParent / routing switch / emulated host scripts that a host value net reaches
+        through the logic scripts (If, Or, And, Not, MaxOf2): a control there changes the device structure."""
+        hits, todo, seen = [], [r0], set()
+        while todo and len(seen) < limit:
+            r = todo.pop()
+            if r in seen:
+                continue
+            seen.add(r)
+            for hk, hv, _ in (dv.nets.get(r) or {}).get("host", []):
+                pep = dv.algos[hk]["pep"]
+                if pep in POLY_PEPS and hv == "Voices":
+                    hits.append(("voices", hk))
+                elif hk in dv.switches and hv == "Switch":
+                    hits.append(("switch", hk))
+                elif hk in dv.layers and hv == "ActiveState":
+                    hits.append(("layer", hk))
+                elif pep in LOGIC_PEPS and hv != "Out":
+                    o = dv._var_net(dv.algos[hk], "Out")
+                    if o is not None:
+                        todo.append(o)
+        return hits
+
+    def follow(r0, self_key, chain0=()):
+        """Targets of a host value net: DSP input pads (with the converter chain), routing switches,
+        emulated host scripts ('host': HOST_FUNCS input) and structure changes ('structure')."""
         targets, blocked = [], []
-        todo, visited = [(r0, [])], set()
+        todo, visited = [(r0, list(chain0))], set()
         while todo:
             r, chain = todo.pop()
             if r in visited or len(visited) > 50:
@@ -842,14 +1309,27 @@ def plan(dev_path, dsp_dir=DEFAULT_DSP_DIR, switch_values=None):
                                 "unit_name": UNIT_NAMES.get(unit, str(unit)),
                                 "encoding": _encoding(cp, v, unit), "chain": chain,
                                 "sync": bool(cp.sync) if cp is not None else bool(_attrs(v).get("Sync"))})
+            structural = False
             for hk, hv, pid in n["host"]:
                 h = dv.algos[hk]
-                if hk == key or h["pep"] in KNOB_PEPS or h["pep"] in TEXT_PEPS or h["pep"] in JUNCTION_PEPS \
+                if hk == self_key or h["pep"] in KNOB_PEPS or h["pep"] in TEXT_PEPS or h["pep"] in JUNCTION_PEPS \
                         or h["pep"] in BUTTON_PEPS:
                     continue
                 if hk in dv.switches and hv == "Switch":
                     targets.append({"kind": "switch", "key": hk, "chain": chain, "pep": h["pep"],
                                     "choices": dv.switches[hk]["choices"]})
+                    continue
+                if h["pep"] in HOST_FUNCS and (h["pep"] != "Attenuator" or hk in dyn_att):
+                    if hv in HOST_FUNCS[h["pep"]]["in"]:
+                        targets.append({"kind": "host", "script": hk, "var": hv, "chain": chain})
+                    continue                # (an output of the script: the value came from there)
+                if h["pep"] in LOGIC_PEPS or h["pep"] in POLY_PEPS or (hk in dv.layers and hv == "ActiveState"):
+                    if (h["pep"] in POLY_PEPS and hv == "Voices") or (hk in dv.layers) or \
+                            (hv != "Out" and logic_reach(r)):
+                        if chain:
+                            blocked.append("structure control behind a converter (%s)" % hk.rsplit("/", 1)[-1])
+                        else:
+                            structural = True
                     continue
                 if h["pep"] in GUI_PEPS or h["pep"].startswith("Surfaces@"):
                     continue
@@ -866,6 +1346,50 @@ def plan(dev_path, dsp_dir=DEFAULT_DSP_DIR, switch_values=None):
                     ov = h["vars"].get(outvar)
                     if ov is not None and ov.f.get("id"):
                         todo.append((dv.uf.find(ov.f["id"]), chain + steps))
+            if structural and not any(t.get("kind") == "structure" for t in targets):
+                targets.append({"kind": "structure", "key": self_key, "chain": [],
+                                "reach": sorted({k for _, k in logic_reach(r)})})
+        return targets, blocked
+
+    # emulated multi-input host scripts (Pan, Ch1632X, ...): their outputs, followed to the DSP pads
+    for hk, h in dv.algos.items():
+        spec = HOST_FUNCS.get(h["pep"])
+        if spec is None or (h["pep"] == "Attenuator" and hk not in dyn_att):
+            continue
+        state = {}
+        for var in spec["in"] + spec["out"]:
+            v = h["vars"].get(var)
+            x = _pval(v) if v is not None else None
+            if dv.logic is not None and v is not None and v.f.get("id"):
+                x = dv.logic.get(dv.uf.find(v.f["id"]), x)
+            state[var] = _num(x, spec.get("defaults", {}).get(var, 0.0))
+        outs = {}
+        for var in spec["out"]:
+            r = dv._var_net(h, var)
+            if r is None:
+                continue
+            tg, bl = follow(r, hk)
+            tg = [t for t in tg if t.get("kind") or t["key"] not in dropped]
+            if tg:
+                outs[var] = tg
+            if bl:
+                dv.warnings.append("%s.%s: %s" % (hk, var, "; ".join(sorted(set(bl)))))
+        if outs:
+            res.setdefault("host_funcs", []).append({"key": hk, "pep": h["pep"], "state": state, "outputs": outs})
+
+    seen_nets = set()
+    for key, al in dv.algos.items():
+        pep = al["pep"]
+        if pep not in KNOB_PEPS and pep not in BUTTON_PEPS:
+            continue
+        vv = al["vars"].get("Val")
+        if vv is None or not vv.f.get("id"):
+            continue
+        r0 = dv.uf.find(vv.f["id"])
+        if r0 in seen_nets:
+            continue
+        seen_nets.add(r0)
+        targets, blocked = follow(r0, key)
         if not targets:
             if blocked and _under_surface(key):
                 res["unmapped_params"].append({"name": _param_name(al, key), "key": key,
@@ -909,7 +1433,7 @@ def plan(dev_path, dsp_dir=DEFAULT_DSP_DIR, switch_values=None):
              "val_default": val, "display": disp, "targets": targets}
         fmt = disp["format"] if disp else None
         p["display_format"] = fmt
-        dsp_t = [t for t in targets if t.get("kind") != "switch"]
+        dsp_t = [t for t in targets if not t.get("kind")]
         p["unit"] = _unit_from_format(fmt) or ""
         p["pad_unit"] = UNIT_NAMES.get(dsp_t[0]["unit"], "") if dsp_t else ""
         try:
@@ -958,18 +1482,119 @@ def plan(dev_path, dsp_dir=DEFAULT_DSP_DIR, switch_values=None):
         dv.warnings.append("license atom %r: its output stays 0 until the host unlocks it at init" % a)
     if not res["modules"]:
         dv.unsupported.append("no DSP modules (host-only device or empty template)")
+    # targets on atoms with 0 voices (inactive mixer channels) stay out; the parameter is kept (stable list)
+    hf = {x["key"] for x in res.get("host_funcs", [])}
+    for q in res["params"]:
+        st = _strip_of(q, gain_src)          # from all targets: the name must not depend on the voices
+        if st is not None:
+            q["strip"] = st
+            if st.startswith("Ch"):
+                q["channel"] = int(st[2:])
+        if any(t.get("kind") == "structure" for t in q["targets"]):
+            q["structure"] = True
+        tg = [t for t in q["targets"] if (t.get("kind") or t["key"] not in dropped) and
+              (t.get("kind") != "host" or t["script"] in hf)]
+        if not tg:
+            q["inactive"] = True
+        q["targets"] = tg
     names = {}
     for q in res["params"]:
-        names[q["name"]] = names.get(q["name"], 0) + 1
+        names.setdefault(q["name"], []).append(q)
+    generic = {"ChannelGroup", "Group", "Channel", "Fader Group", "ChannelsGroup"}
+    for nm, qs in names.items():
+        if len(qs) < 2:
+            continue
+        clusters = {}
+        for q in qs:
+            raw = (dv.algos[q["key"]]["obj"].f.get("name") or q["name"]).lstrip("@")
+            if raw in ("untitled", "Button") or raw.startswith("Poti"):
+                raw = q["name"]
+            q["base_name"] = raw
+            if "strip" in q:
+                q["name"] = "%s %s" % (q["strip"], raw)
+            else:
+                clusters.setdefault(tuple(c.rstrip("'") for c in q["key"].split("/")), []).append(q)
+        for cq in clusters.values():
+            keys = [q["key"].split("/") for q in cq]
+            for q, parts in zip(cq, keys):
+                grp = None
+                for i, comp in enumerate(parts[:-1]):
+                    if len(cq) > 1 and len({p[i] for p in keys}) > 1 and i > 0:
+                        base = comp.rstrip("'")
+                        grp = (parts[i - 1] if base in generic else base, len(comp) - len(base) + 1)
+                        break
+                if grp is not None:
+                    q["group"], q["index"] = grp
+                    q["name"] = "%s %d %s" % (grp[0], grp[1], q["base_name"])
+                else:
+                    q["name"] = "%s (%s)" % (nm, q["key"].rsplit("/", 2)[-2] if q["key"].count("/") > 1 else q["key"])
+    # still equal inside one strip (STM 16 S speaker buttons RS, RS', ...): name the script input they set
+    names = {}
     for q in res["params"]:
-        if names[q["name"]] > 1:
-            q["name"] = "%s (%s)" % (q["name"], q["key"].rsplit("/", 2)[-2] if q["key"].count("/") > 1 else q["key"])
+        names.setdefault(q["name"], []).append(q)
+    for nm, qs in names.items():
+        if len(qs) > 1:
+            for q in qs:
+                hv = [t["var"] for t in q["targets"] if t.get("kind") == "host"]
+                if len({t["var"] for x in qs for t in x["targets"] if t.get("kind") == "host"}) >= len(qs) and hv:
+                    q["name"] = "%s %s" % (nm, hv[0])
+    names = {}
+    for q in res["params"]:
+        names.setdefault(q["name"], []).append(q)
+    for nm, qs in names.items():
+        if len(qs) > 1:
+            for i, q in enumerate(qs[1:], 2):
+                q["name"] = "%s #%d" % (nm, i)
     res["dsp_cycles"] = sum(m["cycles"] or 0 for m in res["modules"])
+    # dynamic devices: ports whose connection instantiates modules (RouteByContext 'Connected' -> voices)
+    port_names = {q["name"] for q in res["ports"]}
+    res["dynamic_ports"] = sorted({_pval(al["vars"].get("PadName")) for al in dv.algos.values()
+                                   if al["pep"] == "RouteByContext" and "Connected" in al["vars"]} & port_names)
+    res["structure"] = {k: v for k, v in dv.structure.items()}
+    # MIDI: devices whose MIDI pads only reach controller modules (M_C_*: channel filter, CC -> value, used by
+    # the mixers for automation) work with the MIDI ports left open; note-driven devices (synths) need MIDI
+    midi_mods = [m for m in res["modules"] if dv.atoms.get(m["key"], {}).get("midi")]
+    note_mods = [m for m in midi_mods if not (m["dsp_file"] or "").upper().startswith(MIDI_CONTROL_PREFIXES)]
+    res["needs_midi"] = bool(note_mods)
+    res["midi_optional"] = bool(res.get("midi_ports")) and not note_mods
+    if res.get("midi_ports"):
+        dv.warnings.append("MIDI port(s) %s: %s" % (", ".join(res["midi_ports"]),
+                           "needs MIDI routing (note input)" if note_mods else
+                           "controller automation only, may stay unconnected"))
     _pc_delay_annotate(res, dv)
     res["complete"] = not dv.unsupported
     dv.unsupported[:] = sorted(set(dv.unsupported))
     res["order"] = _topo(res)
     return res
+
+
+def _strip_from_key(k):
+    for comp in (k or "").split("/")[1:]:
+        m = re.fullmatch(r"(Ch|Ax)?\s*(\d+)", comp.rstrip("'"))
+        if m:
+            return "%s%d" % (m.group(1) or "Ch", int(m.group(2)))
+    return None
+
+
+def _strip_of(q, gain_src=None):
+    """Mixer strip of a parameter: the module path component '<n>' / 'Ch<n>' (channel n) or 'Ax<n>' (aux
+    return n) of what the control drives (DSP pad, emulated host script, structure); for the per-input gain
+    pads 'G<n>' of the bus adders (32ADD) the input number.  None when the control drives several strips."""
+    found = set()
+    for t in q.get("targets", []):
+        hit = None
+        if not t.get("kind") and gain_src is not None:
+            hit = gain_src(t["key"], t["in"])
+        for k in [] if hit else [t.get("key"), t.get("script")]:
+            hit = _strip_from_key(k)
+            if hit:
+                break
+        for k in t.get("reach") or []:
+            if _strip_from_key(k):
+                found.add(_strip_from_key(k))
+        if hit:
+            found.add(hit)
+    return found.pop() if len(found) == 1 else None
 
 
 def _close(a, b):
@@ -1376,6 +2001,22 @@ def _is_array_out(lay, k):
         return bool(lay["ao_rec"]) and lay["ao_first"] <= k < lay["ao_first"] + lay["ao_rec"]
     j = k - lay["atom_ao"]
     return bool(lay["so_rec"]) and lay["so_first"] <= j < lay["so_first"] + lay["so_rec"]
+
+
+def _max_voices(cls):
+    """Largest n with a '<prefix><n>' entry for the module's '<prefix>VoiceDef' symbol (Sim2k SetVoices
+    clamps to maxVoices; 32ADD: jmpVoice1..32)."""
+    names = {s.name for s in cls.obj.symbols}
+    best = 0
+    for nm in names:
+        if nm.endswith("VoiceDef"):
+            pre = nm[:-3]
+            n = 1
+            while pre + str(n + 1) in names:
+                n += 1
+            if pre + "1" in names:
+                best = max(best, n)
+    return best
 
 
 def voice_cycles(cycles, voices):

@@ -28,8 +28,8 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QDockWid
 
 import pulsar_values
 import scope_device
-from pulsar_widgets import Knob, Piano
-from PySide6.QtWidgets import QComboBox, QPushButton
+from pulsar_widgets import Fader, Knob, Meter, Piano
+from PySide6.QtWidgets import QComboBox, QFrame, QPushButton, QScrollArea
 
 SOCKET = os.environ.get("PULSARD_SOCKET", "/run/pulsard.sock")
 LAYOUT_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
@@ -508,6 +508,211 @@ class DevParam:
         return pulsar_values.Param(self.name, self.unit).fmt(v)
 
 
+def _strip_key(k):
+    m = re.match(r"([A-Za-z]+)(\d+)$", k or "")
+    return (0 if m.group(1) == "Ch" else 1, m.group(1), int(m.group(2))) if m else (2, k or "", 0)
+
+
+class MixerPanel(QDialog):
+    """SCOPE-like mixer front panel: one strip per channel (knobs, buttons, fader) + a master section.
+    Built from the device params that carry a 'strip' (Ch<n> / Ax<n>); structural switches (Stereo, channel
+    count, phase compensation) re-plan the device in pulsard, then the panel is rebuilt."""
+
+    def __init__(self, win, node):
+        super().__init__(win)
+        self.win, self.node = win, node
+        self.setWindowTitle((node.desc.get("title") or node.id) + " - mixer")
+        self.resize(min(1500, win.width()), 580)
+        self.meters = {}                       # (strip, side) -> Meter
+        outer = QVBoxLayout(self)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        outer.addWidget(area, 1)
+        body = QWidget()
+        area.setWidget(body)
+        row = QHBoxLayout(body)
+        row.setSpacing(2)
+        try:
+            self.meter_keys = [(m["strip"], m["side"]) for m in
+                               request({"cmd": "meters", "id": node.id}, timeout=3).get("meters", [])]
+        except DaemonError:
+            self.meter_keys = []
+        strips, master = {}, []
+        for q in node.desc.get("params", []):
+            (strips.setdefault(q["strip"], []) if q.get("strip") else master).append(q)
+        for key in sorted(strips, key=_strip_key):
+            row.addWidget(self.strip(key, strips[key]))
+        nk = max([sum(1 for q in v if not q.get("discrete")) - 1 for v in strips.values()] + [0])
+        nb = max([sum(1 for q in v if q.get("discrete")) for v in strips.values()] + [0])
+        self.resize(self.width(), min(960, 300 + 84 * nk + 30 * nb))
+        row.addWidget(self.master(master))
+        row.addStretch(1)
+        info = QLabel("Channels appear when their input is connected (dimmed strips are not created yet). "
+                      "Fader/knob: drag (Shift = fine), wheel, double-click = default.  "
+                      "%s - DSP%s, %d cycles" % (node.desc.get("file", ""), node.desc.get("dsp"),
+                                                 node.desc.get("cycles", 0)))
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #888")
+        outer.addWidget(info)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll_meters)
+        if self.meters:
+            self.timer.start(110)
+
+    def poll_meters(self):
+        if not self.isVisible():
+            return
+        try:
+            ms = request({"cmd": "meters", "id": self.node.id}, timeout=2).get("meters", [])
+        except DaemonError:
+            self.timer.stop()
+            return
+        for m in ms:
+            w = self.meters.get((m["strip"], m["side"]))
+            if w is not None:
+                w.set_db(m["db"])
+
+    def closeEvent(self, e):
+        self.timer.stop()
+        super().closeEvent(e)
+
+    def meter_widgets(self, strip):
+        sides = [sd for (st, sd) in self.meter_keys if st == strip]
+        out = []
+        for sd in sorted(set(sides)):
+            w = Meter(self, height=150)
+            w.setToolTip("%s %s input level (dBFS)" % (strip, sd))
+            self.meters[(strip, sd)] = w
+            out.append(w)
+        return out
+
+    # widgets
+    def control(self, q, label):
+        cur = q.get("value") if q.get("value") is not None else q.get("default")
+        ctl = (q.get("spec") or {}).get("control") or ""
+        if q.get("discrete") and (q.get("max") or 0) - (q.get("min") or 0) <= 1:
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setChecked(bool(cur))
+            b.setFixedWidth(64)
+            b.setToolTip(q["name"] + ("  (changes the mixer structure)" if q.get("structure") else ""))
+            if "mute" in label.lower():         # SCOPE mute buttons: lit = channel on
+                b.setStyleSheet("QPushButton:checked { background: #5a8a3a; } "
+                                "QPushButton:!checked { background: #8a3030; }")
+                base = label
+
+                def mute_text(on, b=b, base=base):
+                    b.setText(base.replace("Mute", "On") if on else base.replace("Mute", "Muted"))
+                mute_text(bool(cur))
+                b.toggled.connect(mute_text)
+            b.toggled.connect(lambda on, q=q: self.send(q, 1 if on else 0))
+            return b, "button"
+        prm = DevParam(q)
+        prm.name = label
+        if "Fader" in ctl or label.lower().endswith("fader") or label == "Fader":
+            w = Fader(prm, cur, label=label)
+            w.changed.connect(lambda v, q=q: self.send(q, v))
+            return w, "fader"
+        w = Knob(prm, cur, size=46)
+        w.changed.connect(lambda v, q=q: self.send(q, v))
+        return w, "knob"
+
+    def column(self, title, items, dim=False, width=78, meters=()):
+        box = QFrame()
+        box.setFrameShape(QFrame.StyledPanel)
+        box.setFixedWidth(width)
+        box.setStyleSheet("QFrame { background: %s; border-radius: 4px; }" % ("#26262a" if dim else "#303036"))
+        v = QVBoxLayout(box)
+        v.setContentsMargins(3, 4, 3, 4)
+        v.setSpacing(3)
+        t = QLabel(title)
+        t.setAlignment(Qt.AlignCenter)
+        t.setStyleSheet("font-weight: bold; color: %s;" % ("#777" if dim else "#ddd"))
+        v.addWidget(t)
+        knobs = [w for w, k in items if k == "knob"]
+        buttons = [w for w, k in items if k == "button"]
+        faders = [w for w, k in items if k == "fader"]
+        for w in knobs + buttons:
+            v.addWidget(w, 0, Qt.AlignHCenter)
+        v.addStretch(1)
+        fr = QHBoxLayout()
+        fr.setSpacing(1)
+        fr.addStretch(1)
+        for w in faders:
+            fr.addWidget(w, 0, Qt.AlignBottom)
+        for m in meters:
+            fr.addWidget(m, 0, Qt.AlignBottom)
+        fr.addStretch(1)
+        v.addLayout(fr)
+        box.setEnabled(not dim)
+        return box
+
+    SHORT = {"Invert Phase": "Phase Ø", "Pan Position": "Pan", "Stereo/Mono": "Stereo", "Position Hor": "Pos X",
+             "Position Vert": "Pos Y", "divergence": "Diverg."}
+
+    def label_of(self, q):
+        b = q.get("base_name") or q["name"]
+        m = re.search(r" #(\d+)$", q["name"])
+        b = self.SHORT.get(b, b)
+        if m:                                   # duplicated control (e.g. phase of the right channel)
+            b += " R" if m.group(1) == "2" else " " + m.group(1)
+        b = re.sub(r"^AUX Send (\d) Level$", r"Aux \1", b)
+        return b
+
+    @staticmethod
+    def _order(q):
+        b = q.get("base_name") or q["name"]
+        m = re.search(r"(\d+)", b)
+        return (0 if b.startswith("AUX") else 1, int(m.group(1)) if m else 0)
+
+    def strip(self, key, qs):
+        qs = sorted(qs, key=self._order)
+        items = [self.control(q, self.label_of(q)) for q in qs]
+        fad = [q for q in qs if "Fader" in ((q.get("spec") or {}).get("control") or "")]
+        dim = all(q.get("inactive") for q in (fad or [q for q in qs if not q.get("structure")]))
+        return self.column(key.replace("Ch", "Ch ").replace("Ax", "Aux "), items, dim,
+                           width=78 + 9 * max(0, len([1 for st, _ in self.meter_keys if st == key]) - 0),
+                           meters=self.meter_widgets(key))
+
+    MASTER_SHORT = {"Activate Phase Compensation": "Phase comp.", "Phase Compensation": "Phase comp.",
+                    "Reset Margin": "Reset peaks", "Margin Reset": "Reset peaks", "Select Channel": "Channels",
+                    "Mute (MasterGroup)": "Mute", "Mute (Master)": "Mute", "MasterGroup": "Master",
+                    "Fader Group (Fader Group)": "Master", "VU-Mode": "VU mode", "KillSolo": "Kill solo"}
+
+    def master(self, qs):
+        shown = [q for q in qs if not q["name"].startswith("MIDI")]
+        items = []
+        for q in shown:
+            label = self.MASTER_SHORT.get(q["name"]) or re.sub(r"^AuxGroup (\d) ", r"Aux \1 ", q["name"])
+            label = label.replace(" Pre Post", " pre").replace(" (AuxGroup)", "")
+            label = re.sub(r" Fader$", "", label)
+            w, kind = self.control(q, label)
+            if kind == "button":
+                w.setFixedWidth(84)
+            items.append((w, kind))
+        n_f = sum(1 for _, k in items if k == "fader")
+        box = self.column("Master", items, False, width=max(110, 58 * max(1, n_f) + 20),
+                          meters=self.meter_widgets("Master"))
+        box.setStyleSheet(box.styleSheet() + " QPushButton { font-size: 8pt; padding: 2px; }")
+        return box
+
+    def send(self, q, v):
+        if q.get("structure"):
+            if self.win.call({"cmd": "set_param", "id": self.node.id, "name": q["name"], "value": v}) is None:
+                return
+            self.win.mark_dirty()
+            self.win.refresh()
+            node = self.win.nodes.get(self.node.id)
+            if node is not None:
+                p = MixerPanel(self.win, node)
+                p.move(self.pos())
+                p.show()
+            self.close()
+            return
+        q["value"] = v
+        self.win.set_param_live(self.node.id, q["name"], v)
+
+
 class DevicePanel(QDialog):
     """Front panel of a SCOPE device: one knob per parameter (switches as buttons), applied live."""
 
@@ -950,7 +1155,10 @@ class Window(QMainWindow):
 
     def edit_values(self, node):
         if node.desc.get("kind") == "device":
-            DevicePanel(self, node).show()
+            if any(q.get("strip") for q in node.desc.get("params", [])):
+                MixerPanel(self, node).show()
+            else:
+                DevicePanel(self, node).show()
             return
         if node.desc.get("fixed"):
             QMessageBox.information(self, "Pulsar Scope", "The levels of the base configuration are in the ALSA "

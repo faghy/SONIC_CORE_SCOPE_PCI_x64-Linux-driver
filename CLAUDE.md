@@ -226,5 +226,12 @@ sudo rmmod snd-pulsar
    pipewire-jack-x86_64-linux-gnu.conf). Verified by the user: import+playback, recording from analog in, MIDI track -> DSP test synth. JACK ports:
    "Pulsar2 Stereo:capture_FL/FR, playback_FL/FR", "Pulsar2 MIDI:Synth In"; 48 kHz, buffer 1024. Ardour's ALSA backend is
    not usable (PipeWire owns the card, periods fixed at 4).
+4k. **Factory mixers + GUI (2026-10-08), verified by the user on the card (DynamicMixer).** scope_device: voice counts
+   (numVoices 0 = module not created), dynamic devices (channels exist while their input pad is connected; `@connected`,
+   `Select Channel`), emulated host scripts (Pan, Attenuator, Ch1632X...), Compensate Delay Linker = host-only (delays 0);
+   docs/device_format.md section 9. pulsard: structure re-plan on connect/disconnect, multi-DSP split, sync-slot reuse,
+   `meters {id}` (SCOPE vumulti*.dsp: meter j = VU input 3+2j, level = async out 3j, 1.31 decaying peak; mapped to strips
+   via the In<n>/IR<n> port targets), survey cache devices-v4.json. GUI: MixerPanel (strips, Fader, Meter widgets,
+   Mute shown as On/Muted: SCOPE mute lit = channel ON), drag-to-pan rack, on-screen MIDI keyboard, coloured DSP load.
 5. **Next:** factory synths (voice arrays from pc_midi),
    ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), then the SCOPE-like config app.

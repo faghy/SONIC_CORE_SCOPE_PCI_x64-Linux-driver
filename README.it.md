@@ -25,6 +25,7 @@ Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `
 | Pacchetto `.deb` (driver DKMS, servizio, strumenti, app) | **funziona** |
 | Dispositivi SCOPE (`.dev`): 36 effetti (EQ, filtri, dinamica, distorsione, phaser, flanger, chorus…) come un unico blocco con manopole in unità reali | **funziona** |
 | Manopole in stile SCOPE (Hz, dB…) per dispositivi e moduli comuni, codifica corretta degli ingressi float/interi | **funziona** |
+| Mixer di fabbrica di SCOPE (DynamicMixer, MicroMixer, STM 1632, STM 16 S, STM 48 S) come un unico blocco: i canali compaiono collegando gli ingressi, pannello a strisce con fader, pan, mute (On/Muted), mandate aux e meter d'ingresso per canale | **funziona** (DynamicMixer provato sulla scheda) |
 | GUI: trascinamento della vista col mouse, zoom verso il puntatore, tastiera MIDI a schermo (mouse + tasti del computer), carico DSP colorato | **funziona** |
 | Delay e riverberi (linee di ritardo nella RAM del PC, nuovi ioctl del kernel) | **funzionante** (Delay S provato sulla scheda) |
 | Dispositivi "Effect Package" con licenza: sbloccati dalla scheda con il **tuo** file di licenza SCOPE (`sudo pulsar-import-dsp --license TUOSERIALE.v5`) | **funzionante**: 107 dispositivi con licenza |

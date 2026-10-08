@@ -26,6 +26,7 @@ SHARC ADSP-21065L). It was written by reverse engineering the Windows SCOPE 5.1 
 | `.deb` package (DKMS driver, service, tools, GUI) | **working** |
 | SCOPE devices (`.dev`): 36 effects (EQ, filters, dynamics, distortion, phaser, flanger, chorus…) as one block with knobs in real units | **working** |
 | SCOPE-style knobs (Hz, dB…) for devices and common modules, correct float/integer pad encoding | **working** |
+| SCOPE factory mixers (DynamicMixer, MicroMixer, STM 1632, STM 16 S, STM 48 S) as one block: channels appear when their input is connected, channel-strip panel with faders, pan, mute (On/Muted), aux sends and per-channel input meters | **working** (DynamicMixer tested on the card) |
 | GUI: drag the rack view with the mouse, zoom to the pointer, on-screen MIDI keyboard (mouse + computer keys), coloured DSP load | **working** |
 | Delays and reverbs (PC-side delay lines in host RAM, new kernel ioctls) | **working** (Delay S tested on the card) |
 | Licensed "Effect Package" devices: unlocked by the card with **your own** SCOPE licence key file (`sudo pulsar-import-dsp --license YOURSERIAL.v5`) | **working**: 107 devices with a licence |
