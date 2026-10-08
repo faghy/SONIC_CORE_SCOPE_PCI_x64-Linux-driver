@@ -14,6 +14,7 @@ LXQt/LXDE, XFCE...): it uses Qt's Fusion style with its own dark palette.
 import json
 import math
 import os
+import re
 import socket
 import sys
 
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QDockWid
 
 import pulsar_values
 import scope_device
-from pulsar_widgets import Knob
+from pulsar_widgets import Knob, Piano
 from PySide6.QtWidgets import QComboBox, QPushButton
 
 SOCKET = os.environ.get("PULSARD_SOCKET", "/run/pulsard.sock")
@@ -287,11 +288,13 @@ class RackView(QGraphicsView):
         self.win = win
         self.setScene(QGraphicsScene(-2000, -2000, 6000, 4000))
         self.setRenderHint(QPainter.Antialiasing)
-        self.setDragMode(QGraphicsView.RubberBandDrag)
+        self.setDragMode(QGraphicsView.NoDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setAcceptDrops(True)
         self.setBackgroundBrush(C_BG)
         self.temp = None
         self.temp_from = None
+        self.pan_from = None                 # view position where a pan (drag on empty area) started
 
     def drawBackground(self, p, rect):
         p.fillRect(rect, C_BG)
@@ -322,9 +325,27 @@ class RackView(QGraphicsView):
                     self.start_wire(it)
                     e.accept()
                     return
+        # pan: middle button anywhere, or left button on the empty area (Ctrl/Shift + left = rubber-band selection)
+        on_empty = not self.items(e.position().toPoint())
+        mods = e.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
+        if e.button() == Qt.MiddleButton or (e.button() == Qt.LeftButton and on_empty and not mods):
+            if e.button() == Qt.LeftButton:
+                self.scene().clearSelection()
+            self.pan_from = e.position()
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+            e.accept()
+            return
+        if e.button() == Qt.LeftButton and on_empty and mods:
+            self.setDragMode(QGraphicsView.RubberBandDrag)
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
+        if self.pan_from is not None:
+            d = e.position() - self.pan_from
+            self.pan_from = e.position()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(round(d.x())))
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(round(d.y())))
+            return
         if self.temp is not None:
             a = self.temp_from.scene_pos()
             b = self.mapToScene(e.position().toPoint())
@@ -333,6 +354,14 @@ class RackView(QGraphicsView):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
+        if self.pan_from is not None:
+            self.pan_from = None
+            self.viewport().unsetCursor()
+            return
+        if self.dragMode() == QGraphicsView.RubberBandDrag:
+            super().mouseReleaseEvent(e)
+            self.setDragMode(QGraphicsView.NoDrag)
+            return
         if self.temp is not None:
             self.scene().removeItem(self.temp)
             self.temp = None
@@ -351,7 +380,20 @@ class RackView(QGraphicsView):
 
     def wheelEvent(self, e):
         f = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15
-        self.scale(f, f)
+        z = self.transform().m11() * f
+        if 0.2 <= z <= 3.0:
+            self.scale(f, f)
+
+    def fit_all(self):
+        r = self.scene().itemsBoundingRect()
+        if not r.isEmpty():
+            self.fitInView(r.adjusted(-40, -40, 40, 40), Qt.KeepAspectRatio)
+            if self.transform().m11() > 1.5:
+                self.reset_zoom()
+                self.centerOn(r.center())
+
+    def reset_zoom(self):
+        self.resetTransform()
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
@@ -576,6 +618,103 @@ class KnobPanel(QDialog):
 
 # --------------------------------------------------------------------------- main window
 
+class MidiOut:
+    """ALSA sequencer output of the on-screen keyboard, connected to pulsard's "Pulsar2 MIDI" client."""
+
+    def __init__(self):
+        self.tx, self.error = None, None
+
+    @staticmethod
+    def find_client(name="Pulsar2 MIDI"):
+        try:
+            with open("/proc/asound/seq/clients") as f:
+                for line in f:
+                    m = re.match(r'Client\s+(\d+)\s*:\s*"(.*)"', line)
+                    if m and m.group(2) == name:
+                        return int(m.group(1))
+        except OSError:
+            pass
+        return None
+
+    def send(self, data):
+        try:
+            if self.tx is None:
+                import pulsar_midi
+                cl = self.find_client()
+                if cl is None:
+                    raise RuntimeError("MIDI client 'Pulsar2 MIDI' not found (is pulsard running with MIDI?)")
+                tx = pulsar_midi.SeqSender("Pulsar Scope keyboard")
+                tx.connect_to(cl, 0)
+                self.tx = tx
+            self.tx.send(bytes(data))
+            self.error = None
+        except Exception as e:                # the keyboard must never break the GUI
+            self.tx, self.error = None, str(e)
+        return self.error
+
+
+class KeyboardBar(QWidget):
+    """Dock content: piano + octave/velocity/channel + panic."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win, self.midi, self.channel = win, MidiOut(), 0
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 4)
+        row = QHBoxLayout()
+        self.piano = Piano(self)
+        self.piano.note_on.connect(lambda n, v: self.out([0x90 | self.channel, n, v]))
+        self.piano.note_off.connect(lambda n: self.out([0x80 | self.channel, n, 0]))
+        b_dn, b_up = QPushButton("Oct -"), QPushButton("Oct +")
+        b_dn.clicked.connect(lambda: self.octave(-12))
+        b_up.clicked.connect(lambda: self.octave(12))
+        self.oct_label = QLabel()
+        self.vel = QSlider(Qt.Horizontal)
+        self.vel.setRange(1, 127)
+        self.vel.setValue(100)
+        self.vel.setMaximumWidth(120)
+        self.vel.valueChanged.connect(self.set_velocity)
+        self.vel_label = QLabel()
+        self.ch = QComboBox()
+        self.ch.addItems(["Ch %d" % (i + 1) for i in range(16)])
+        self.ch.currentIndexChanged.connect(self.set_channel)
+        panic = QPushButton("Panic")
+        panic.setToolTip("All notes off")
+        panic.clicked.connect(self.panic)
+        self.info = QLabel("click the keys, or click here and play with the computer keys Z S X D C ... / Q 2 W 3 E ...")
+        self.info.setStyleSheet("color: #888")
+        for w in (b_dn, self.oct_label, b_up, QLabel("  Velocity"), self.vel, self.vel_label, self.ch, panic):
+            row.addWidget(w)
+        row.addWidget(self.info, 1)
+        lay.addLayout(row)
+        lay.addWidget(self.piano)
+        self.set_velocity(100)
+        self.octave(0)
+
+    def octave(self, d):
+        self.piano.set_base(self.piano.base + d)
+        self.oct_label.setText("C%d" % (self.piano.base // 12 - 1))
+
+    def set_velocity(self, v):
+        self.piano.velocity = v
+        self.vel_label.setText(str(v))
+
+    def set_channel(self, c):
+        self.piano.all_off()
+        self.channel = c
+
+    def panic(self):
+        self.piano.all_off()
+        for c in range(16):
+            self.out([0xB0 | c, 123, 0])
+
+    def out(self, data):
+        err = self.midi.send(data)
+        if err:
+            self.info.setText(err)
+            self.info.setStyleSheet("color: #e66")
+
+
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -610,8 +749,9 @@ class Window(QMainWindow):
         self.dsp_bars = []
         for d in range(6):
             b = QProgressBar()
-            b.setFormat("DSP%d %%p%%" % d)
-            b.setMaximumWidth(110)
+            b.setFormat("DSP%d  %%p%%" % d)
+            b.setMinimumWidth(96)
+            b.setMaximumWidth(130)
             b.setTextVisible(True)
             self.statusBar().addPermanentWidget(b)
             self.dsp_bars.append(b)
@@ -635,6 +775,24 @@ class Window(QMainWindow):
             act = fm.addAction(text)
             act.setShortcut(key)
             act.triggered.connect(slot)
+        # on-screen MIDI keyboard
+        self.kbd = KeyboardBar(self)
+        kdock = QDockWidget("Keyboard", self)
+        kdock.setObjectName("keyboard")
+        kdock.setWidget(self.kbd)
+        self.addDockWidget(Qt.BottomDockWidgetArea, kdock)
+
+        vm = self.menuBar().addMenu("&View")
+        for text, key, slot in (("Zoom to &fit", "Ctrl+0", self.view.fit_all),
+                                ("&Reset zoom (100%)", "Ctrl+1", self.view.reset_zoom)):
+            act = vm.addAction(text)
+            act.setShortcut(QKeySequence(key))
+            act.triggered.connect(slot)
+        vm.addSeparator()
+        vm.addAction(dock.toggleViewAction())
+        vm.addAction(kdock.toggleViewAction())
+        hm = self.menuBar().addMenu("&Help")
+        hm.addAction("Mouse and keys…").triggered.connect(self.show_help)
         self.update_title()
 
         self.refresh()
@@ -669,6 +827,9 @@ class Window(QMainWindow):
             b = self.dsp_bars[d["dsp"]]
             b.setMaximum(max(1, d["budget"]))
             b.setValue(min(d["cycles"], d["budget"]))
+            pct = d["cycles"] / max(1, d["budget"])
+            col = "#3c9a4a" if pct < 0.6 else ("#d08a1e" if pct < 0.85 else "#c83c3c")
+            b.setStyleSheet("QProgressBar { text-align: center; } QProgressBar::chunk { background: %s; }" % col)
             b.setToolTip("DSP%d: %d modules, %d/%d cycles per sample, PM free %d, DM free %d words" %
                          (d["dsp"], d["modules"], d["cycles"], d["budget"], d["pm_free"], d["dm_free"]))
         seen = set()
@@ -949,6 +1110,18 @@ class Window(QMainWindow):
             json.dump(self.layout, f)
 
     # ---- projects
+    def show_help(self):
+        QMessageBox.information(self, "Pulsar Scope", (
+            "Rack\n"
+            "  drag on an empty area (or middle button): move the view\n"
+            "  mouse wheel: zoom   Ctrl+0: zoom to fit   Ctrl+1: 100%\n"
+            "  Ctrl/Shift + drag on an empty area: select several blocks\n"
+            "  drag from a pad to a pad: cable   Delete: remove the selection\n"
+            "  double-click a block: knobs / values\n\n"
+            "Keyboard\n"
+            "  click the keys (drag for glissando), or click the keyboard and use the computer keys:\n"
+            "  Z S X D C V G B H N J M = one octave, Q 2 W 3 E R 5 T 6 Y 7 U = the octave above"))
+
     def update_title(self):
         name = os.path.basename(self.project_path) if self.project_path else "untitled"
         self.setWindowTitle("%s%s - Pulsar Scope" % ("*" if self.dirty else "", name))

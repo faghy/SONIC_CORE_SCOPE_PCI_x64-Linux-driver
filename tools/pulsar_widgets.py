@@ -4,6 +4,9 @@ pulsar_widgets - SCOPE-style controls for Pulsar Scope (Qt / PySide6).
 Knob: dark round knob with an orange value arc, name above and value + unit below.
   drag up/down to turn (Shift = fine), mouse wheel, double-click = default value.
 It works on a normalised position t (0..1) and a pulsar_values.Param that maps t to the displayed value.
+
+Piano: on-screen keyboard (mouse, glissando by dragging, computer keys in two rows like a tracker), emits
+note_on(note, velocity) / note_off(note).
 """
 
 import math
@@ -114,3 +117,144 @@ class Knob(QWidget):
         # value
         p.setPen(C_TEXT)
         p.drawText(QRectF(0, 16 + s - 2, w, 16), Qt.AlignCenter, self.param.fmt(self.value()))
+
+
+# ---------------------------------------------------------------- on-screen keyboard
+C_WHITE = QColor(232, 232, 228)
+C_BLACK = QColor(28, 28, 30)
+C_DOWN = QColor(255, 160, 40)
+_WHITE_STEPS = (0, 2, 4, 5, 7, 9, 11)
+_BLACK_AFTER = {0: 1, 1: 3, 3: 6, 4: 8, 5: 10}           # white key index in the octave -> black note offset
+# computer keys: lower row from the base note, upper row one octave up (tracker layout)
+KEY_ROWS = (("Z", "S", "X", "D", "C", "V", "G", "B", "H", "N", "J", "M", ",", "L", ".", ";", "/"),
+            ("Q", "2", "W", "3", "E", "R", "5", "T", "6", "Y", "7", "U", "I", "9", "O", "0", "P", "[", "=", "]"))
+
+
+class Piano(QWidget):
+    note_on = Signal(int, int)
+    note_off = Signal(int)
+
+    def __init__(self, parent=None, octaves=4, base=36):
+        super().__init__(parent)
+        self.octaves, self.base, self.velocity = octaves, base, 100
+        self.down = set()                     # notes currently held (mouse or keys)
+        self.mouse_note = None
+        self.key_notes = {}                   # Qt key -> note
+        self.setMinimumHeight(70)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFixedHeight(90)
+
+    def set_base(self, base):
+        self.all_off()
+        self.base = max(0, min(127 - 12 * self.octaves, base))
+        self.update()
+
+    # geometry
+    def _keys(self):
+        """[(note, rect, black)] white keys first, then black keys (drawn on top)."""
+        nw = 7 * self.octaves + 1
+        w = self.width() / nw
+        h = self.height() - 1
+        whites, blacks = [], []
+        for i in range(nw):
+            o, k = divmod(i, 7)
+            note = self.base + 12 * o + _WHITE_STEPS[k]
+            whites.append((note, QRectF(i * w, 0, w, h), False))
+            if k in _BLACK_AFTER and i < nw - 1:
+                bn = self.base + 12 * o + _BLACK_AFTER[k]
+                blacks.append((bn, QRectF((i + 1) * w - w * 0.3, 0, w * 0.6, h * 0.6), True))
+        return whites, blacks
+
+    def note_at(self, pos):
+        whites, blacks = self._keys()
+        for note, r, _ in blacks + whites:
+            if r.contains(pos):
+                return note
+        return None
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        whites, blacks = self._keys()
+        f = QFont()
+        f.setPointSizeF(7)
+        p.setFont(f)
+        for note, r, _ in whites:
+            p.setPen(QPen(QColor(90, 90, 90), 1))
+            p.setBrush(C_DOWN if note in self.down else C_WHITE)
+            p.drawRect(r)
+            if note % 12 == 0:
+                p.setPen(QColor(110, 110, 110))
+                p.drawText(r.adjusted(0, 0, 0, -3), Qt.AlignBottom | Qt.AlignHCenter, "C%d" % (note // 12 - 1))
+        for note, r, _ in blacks:
+            p.setPen(QPen(QColor(10, 10, 10), 1))
+            p.setBrush(C_DOWN.darker(130) if note in self.down else C_BLACK)
+            p.drawRect(r)
+
+    # notes
+    def press(self, note):
+        if note is None or note in self.down or not 0 <= note <= 127:
+            return
+        self.down.add(note)
+        self.note_on.emit(note, self.velocity)
+        self.update()
+
+    def release(self, note):
+        if note in self.down:
+            self.down.discard(note)
+            self.note_off.emit(note)
+            self.update()
+
+    def all_off(self):
+        for n in list(self.down):
+            self.release(n)
+        self.key_notes.clear()
+        self.mouse_note = None
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.mouse_note = self.note_at(e.position())
+            self.press(self.mouse_note)
+
+    def mouseMoveEvent(self, e):
+        if self.mouse_note is None:
+            return
+        n = self.note_at(e.position())
+        if n is not None and n != self.mouse_note:
+            self.release(self.mouse_note)
+            self.mouse_note = n
+            self.press(n)
+
+    def mouseReleaseEvent(self, e):
+        if self.mouse_note is not None:
+            self.release(self.mouse_note)
+            self.mouse_note = None
+
+    def _key_note(self, e):
+        t = e.text().upper()
+        for row, start in ((KEY_ROWS[0], self.base + 12), (KEY_ROWS[1], self.base + 24)):
+            if t and t in row:
+                return start + row.index(t)
+        return None
+
+    def keyPressEvent(self, e):
+        if e.isAutoRepeat():
+            return
+        n = self._key_note(e)
+        if n is None:
+            return super().keyPressEvent(e)
+        self.key_notes[e.key()] = n
+        self.press(n)
+
+    def keyReleaseEvent(self, e):
+        if e.isAutoRepeat():
+            return
+        n = self.key_notes.pop(e.key(), None)
+        if n is None:
+            return super().keyReleaseEvent(e)
+        self.release(n)
+
+    def focusOutEvent(self, e):
+        self.all_off()
+        super().focusOutEvent(e)
