@@ -278,6 +278,8 @@ class Graph:
             key, k = port["target"]
             return (n.dev["inner"][key], k)
         pf = port.get("passthrough_from")
+        if isinstance(pf, (list, tuple)):                    # scope_device gives a list of input port names
+            pf = next((x for x in pf if x in n.dev["in_names"]), None)
         if pf and depth < 8 and pf in n.dev["in_names"]:
             w = self.wires.get((src, n.dev["in_names"].index(pf)))
             return self._src_ep(w[0], w[1], depth + 1) if w else None
@@ -531,7 +533,7 @@ class Graph:
         removed = [{"dst": d, "in": i} for (d, i) in self.default_wires if (d, i) not in self.wires]
         values = [{"id": n, "in": i, "value": v} for (n, i), v in self.values.items() if self._visible(n)]
         wires = [w for w in wires if self._visible(w["src"]) and self._visible(w["dst"])]
-        return {"format": "pulsar-project", "version": 1, "rate": self.rate, "modules": mods,
+        return {"format": "pulsar-project", "version": 1, "rate": self.rate, "next_id": self._next, "modules": mods,
                 "wires": wires, "removed": removed, "values": values, "gui": self.gui}
 
     def reset(self):
@@ -547,6 +549,7 @@ class Graph:
         if prj.get("format") != "pulsar-project":
             raise GraphError("not a Pulsar project")
         self.reset()
+        self._next = max(self._next, int(prj.get("next_id") or 0))   # never reuse ids across daemon restarts
         ids, errors = {}, []
         for m in prj.get("modules", []):
             try:

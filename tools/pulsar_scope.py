@@ -643,7 +643,8 @@ class Window(QMainWindow):
             if n is None:
                 n = NodeItem(self, desc)
                 self.view.scene().addItem(n)
-                pos = (st.get("gui", {}).get("layout", {}).get(desc["id"]) or self.layout.get(desc["id"])
+                pos = (self.saved_pos(st.get("gui", {}).get("layout", {}).get(desc["id"]), desc)
+                       or self.saved_pos(self.layout.get(desc["id"]), desc)
                        or self.default_pos(desc, k))
                 n.setPos(QPointF(*pos))
                 self.nodes[desc["id"]] = n
@@ -654,13 +655,37 @@ class Window(QMainWindow):
                 self.view.scene().removeItem(self.nodes.pop(nid))
         self.redraw_wires()
 
+    @staticmethod
+    def saved_pos(entry, desc):
+        """A saved position is used only if it was saved for this very module: node ids are reused after the
+        daemon restarts, so entries carry the title ([x, y, title]); [x, y] without title = just placed here."""
+        if not entry:
+            return None
+        if len(entry) >= 3:
+            return tuple(entry[:2]) if entry[2] == desc.get("title") else None
+        return tuple(entry[:2]) if desc.get("fixed") or tuple(entry[:2]) in getattr(Window, "_fresh", []) else None
+
     def default_pos(self, desc, k):
         cols = {"pc_play": (0, 0), "n3": (0, 200), "n1": (0, 380),
                 "n4": (300, 0), "n5": (300, 120), "n7": (300, 240), "n8": (300, 360),
                 "n6": (600, 60), "n9": (600, 300), "n2": (900, 150), "pc_rec": (900, 360)}
-        if desc["id"] in cols:
+        if desc["id"] in cols and desc.get("fixed"):
             return cols[desc["id"]]
-        return (300 + 40 * (k % 10), 520 + 30 * (k % 10))
+        return self.free_pos(QPointF(300, 520))
+
+    def free_pos(self, start):
+        """First spot at or after `start` (row by row) where a new block does not overlap another one."""
+        taken = [n.sceneBoundingRect().adjusted(-10, -10, 10, 10) for n in self.nodes.values() if n.scene()]
+        x0, y = start.x(), start.y()
+        for row in range(40):
+            x = x0
+            for col in range(8):
+                r = QRectF(x, y, NODE_W + 2 * PAD_R, 90)
+                if not any(r.intersects(t) for t in taken):
+                    return (x, y)
+                x += NODE_W + 60
+            y += 110
+        return (start.x(), start.y())
 
     def redraw_wires(self):
         for w in self.wire_items:
@@ -689,7 +714,7 @@ class Window(QMainWindow):
         for w in self.wire_items:
             if w.src.node is node or w.dst.node is node:
                 w.update_path()
-        self.layout[node.id] = (node.pos().x(), node.pos().y())
+        self.layout[node.id] = (node.pos().x(), node.pos().y(), node.desc.get("title"))
         if not getattr(self, "_refreshing", False) and node.isUnderMouse():
             self.mark_dirty()
         self.save_layout_later()
@@ -715,7 +740,9 @@ class Window(QMainWindow):
     def load_module(self, file, pos):
         r = self.call({"cmd": "load", "file": file})
         if r is not None:
-            self.layout[r["id"]] = (pos.x(), pos.y())
+            fp = self.free_pos(pos)
+            self.layout[r["id"]] = fp
+            Window._fresh = getattr(Window, "_fresh", []) + [fp]
             self.save_layout_later()
             self.mark_dirty()
             self.refresh()
@@ -752,7 +779,9 @@ class Window(QMainWindow):
     def load_device(self, file, pos):
         r = self.call({"cmd": "load_device", "file": file})
         if r is not None:
-            self.layout[r["id"]] = (pos.x(), pos.y())
+            fp = self.free_pos(pos)
+            self.layout[r["id"]] = fp
+            Window._fresh = getattr(Window, "_fresh", []) + [fp]
             self.save_layout_later()
             self.mark_dirty()
             self.refresh()
@@ -874,7 +903,7 @@ class Window(QMainWindow):
         self._save_timer.start(1000)
 
     def save_layout(self):
-        layout = {nid: (n.pos().x(), n.pos().y()) for nid, n in self.nodes.items()}
+        layout = {nid: (n.pos().x(), n.pos().y(), n.desc.get("title")) for nid, n in self.nodes.items()}
         self.layout.update(layout)
         try:
             request({"cmd": "set_gui", "gui": {"layout": layout}})     # kept with the rack and in projects
