@@ -73,6 +73,21 @@ Riavvia (o ricarica il modulo) e la scheda parte da sola. Si rimuove con `sudo a
 (`purge` cancella anche i file DSP importati e il banco salvato). Il pacchetto si costruisce con
 `packaging/build-deb.sh`.
 
+## Ardour (e altre applicazioni JACK)
+
+Provato con Ardour 8.12 su Debian 13: riproduzione e registrazione dagli ingressi analogici.
+Usa il backend **JACK** servito da PipeWire (non il backend ALSA di Ardour: la scheda è già di PipeWire e
+il suo buffer ha 4 periodi da 1024 campioni):
+
+```bash
+sudo apt install pipewire-jack
+sudo cp /usr/share/doc/pipewire/examples/ld.so.conf.d/pipewire-jack-*.conf /etc/ld.so.conf.d/ && sudo ldconfig
+```
+
+Nella finestra Audio/MIDI Setup di Ardour scegli **Audio System: JACK** e premi Start (non serve un server JACK,
+risponde PipeWire). Porte: `Pulsar2 Stereo:capture_FL/FR` (ingressi analogici 1/2), `Pulsar2 Stereo:playback_FL/FR`
+(uscite analogiche 1/2), `Pulsar2 MIDI:Synth In` (MIDI verso il rack DSP). 48 kHz, buffer 1024 campioni (21 ms).
+
 ## Installazione dai sorgenti (avvio automatico)
 
 ```bash

@@ -76,6 +76,21 @@ Reboot (or reload the module): the card starts by itself. Remove with `sudo apt 
 (`purge` also deletes the imported DSP files and the saved rack). Build the package yourself with
 `packaging/build-deb.sh`.
 
+## Ardour (and other JACK applications)
+
+Tested with Ardour 8.12 on Debian 13: playback and recording from the analog inputs.
+Use the **JACK** backend served by PipeWire (do not use Ardour's ALSA backend: PipeWire owns the card and the
+card's buffer has 4 periods of 1024 frames):
+
+```bash
+sudo apt install pipewire-jack
+sudo cp /usr/share/doc/pipewire/examples/ld.so.conf.d/pipewire-jack-*.conf /etc/ld.so.conf.d/ && sudo ldconfig
+```
+
+In Ardour's Audio/MIDI Setup choose **Audio System: JACK** and press Start (no JACK server is needed, PipeWire
+answers). Ports: `Pulsar2 Stereo:capture_FL/FR` (analog in 1/2), `Pulsar2 Stereo:playback_FL/FR` (analog out 1/2),
+`Pulsar2 MIDI:Synth In` (MIDI to the DSP rack). Rate 48 kHz, buffer 1024 frames (21 ms).
+
 ## Installation from source (automatic start-up)
 
 ```bash
