@@ -219,4 +219,7 @@ sudo rmmod snd-pulsar
    uC unlock ops (DSP5, cmd 0x220) before fnInit; devices() hides devices whose seg_id the licence does not cover (107 shown).
    Presets: `presets`/`load_preset` commands, .pre in /var/lib/snd-pulsar/presets, GUI combo in DevicePanel.
    Device survey uses multiprocessing "spawn" (fork deadlocked inside the threaded daemon). NEVER commit the user's .v5/serial.
+   VERIFIED BY EAR (0.5.1): licensed Tremolo S + bypass, preset load, Delay S (PC delay lines), test synth notes + chords.
+   MVC Tune Tab = ABSOLUTE phase increments (default input -> tunedeftab); writing zeros = frequency 0 (old bug).
+   Debug: `pulsarctl peek id=<dev> key=<inner> pad=in|ao|so index=N count=K` or `dsp=D sym=NAME|addr=A` (read-only DSP DM).
 5. **Next:** factory synths (voice arrays from pc_midi), hardware test of delays/reverbs and licensed audio, ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), JACK/Ardour check, .deb package, then the SCOPE-like config app.

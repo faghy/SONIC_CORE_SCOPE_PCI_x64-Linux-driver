@@ -474,7 +474,8 @@ class Graph:
         lay_mvc, lay_mix = sd.voice_layout(mvc.cls), sd.voice_layout(mix.cls)
         voices = max(1, min(voices, lay_mvc["n"], lay_mix["n"]))
         ops = pmid.set_voices_ops(self.rack, mvc, voices) + pmid.set_voices_ops(self.rack, mix, voices)
-        ops += pmid.table_ops(self.rack, mvc, 1, [0] * 128, 128, "MVC tune table (equal temperament)")
+        # Tune Tab (in 1) is left alone: its default input word points at Tunedef.ol's tunedeftab (absolute phase
+        # increments, per sample rate); a table of zeros would give every note frequency 0
         ops += self.rack.set_in_pad(mvc, 3, 16)                                   # omni
         ops += self.rack.set_in_pad(mix, 0, 0x7FFFFFFF // voices)                 # master gain 1/voices
         self.execute(ops)
@@ -650,6 +651,36 @@ class Graph:
         if switched:
             self._replan(n)
         n.dev["params"][name] = value
+
+    def peek(self, req):
+        """Debug: read DSP words. {dsp, addr, count} or {id, [key], pad: in|ao|so, index, [count]}; for inputs also the
+        word the input points at."""
+        n = self.node(req["id"]) if "id" in req else None
+        if n is not None and req.get("key"):
+            n = self.node(n.dev["inner"][req["key"]])
+        if n is not None:
+            m = n.mod
+            off = {"in": m.cls.off_input, "ao": m.cls.off_async_out, "so": m.cls.off_sync_out}[req.get("pad", "so")]
+            dsp, addr = m.dsp, m.seg_mod + off(int(req.get("index", 0)))
+        elif "sym" in req:
+            dsp = int(req["dsp"])
+            d = self.rack.dsp[dsp]
+            hits = [(a, nm) for (sp, a, nm) in d.placed_syms if nm.split(".")[-1] == req["sym"] and sp != "PM"]
+            if not hits and req["sym"] in d.syms:
+                hits = [(d.syms[req["sym"]], req["sym"])]
+            if not hits:
+                raise GraphError("DSP%d: no DM symbol %s" % (dsp, req["sym"]))
+            addr = hits[-1][0]
+        else:
+            dsp, addr = int(req["dsp"]), int(req["addr"])
+        out = []
+        for k in range(min(64, int(req.get("count", 1)))):
+            v = self.b.get_value(dsp, addr + k)
+            row = {"dsp": dsp, "addr": addr + k, "value": v}
+            if n is not None and req.get("pad") == "in" and 0 < v < 0x10000:
+                row["points_to"] = self.b.get_value(dsp, v)
+            out.append(row)
+        return out
 
     def presets(self, dev_id):
         import scope_device as sd
@@ -916,6 +947,8 @@ class Handler(socketserver.StreamRequestHandler):
                         res = {}
                     elif cmd == "load_device":
                         res = {"id": g.load_device(req["file"], req.get("dsp"), req.get("name"), req.get("params"))}
+                    elif cmd == "peek":
+                        res = {"words": g.peek(req)}
                     elif cmd == "presets":
                         res = {"presets": g.presets(req["id"])}
                     elif cmd == "load_preset":

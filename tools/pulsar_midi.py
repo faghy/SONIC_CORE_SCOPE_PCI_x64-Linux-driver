@@ -334,7 +334,7 @@ def test_synth_ops(rack, dsp, voices=4, dsp_dir=DEFAULT_DSP_DIR):
     lay_mvc, lay_mix = sdv.voice_layout(mvc.cls), sdv.voice_layout(mix.cls)
     voices = max(1, min(voices, lay_mvc["n"], lay_mix["n"]))
     ops += set_voices_ops(rack, mvc, voices) + set_voices_ops(rack, mix, voices)
-    ops += table_ops(rack, mvc, 1, [0] * 128, 128, "MVC Tune table (equal temperament: all offsets 0)")
+    # Tune Tab (in 1) keeps its default (tunedeftab = absolute phase increments); zeros would mean frequency 0
     ops += rack.set_in_pad(mvc, 3, 16)                       # channel 16 = omni (bit 4 set) [L]
     ops += rack.connect(src, 0, mvc, 0)                      # SNC2MIDI MIDI Out -> MVC Midi Input
     ops += rack.set_in_pad(mix, 0, 0x7FFFFFFF // max(1, voices))   # master gain 1/voices (no clipping)

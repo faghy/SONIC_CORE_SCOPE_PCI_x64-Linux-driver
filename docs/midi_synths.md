@@ -201,12 +201,14 @@ M_C_IO7 (controller filter) turns CCs into values for knobs (host binding, ignor
   `ALL_NOTES_OFF`, `PROG_CH` and `CHAN_AFTER`.
 - It allocates voices itself. The per-voice tables live at seg_mod 0xB7 (tune), 0xD7 (age), 0xF7 (note) and
   0x107 (velocity), 16 entries each.
-- It turns note + tune-table offset + coarse/fine/pitch bend into a phase increment, using `Pow2` (Mathb0.ol) and
-  `FREQUENZ_TAB2` (Tunedef.ol).
+- NOTE_ON sets the voice frequency to `TuneTab[note]` (seg_mod 0xB7 -> `FREQUENZ_TAB2`, 0xC7); the sync code then
+  scales it by `F_Offset_Faktor` (coarse/fine/pitch bend, `Pow2` from Mathb0.ol). Verified on hardware (2026-10-08).
 - Inputs:
-  - `Tune Tab` (type 0x800001, PROCParam, 128 signed entries): the module reads `DM(DM(in1)) + note`.
-    **It must point at a valid table.** An unconnected input means `_null`, which makes the table base 0 and
-    reads IOP registers. All zeros = equal temperament [L].
+  - `Tune Tab` (type 0x800001, PROCParam, 128 entries): the module reads `DM(DM(in1) + note)`, and the entries are
+    **absolute phase increments** (2^32 = fs), not offsets. Its default input word points at `tunedeftab`
+    (Tunedef.ol; seg_init copies the table for the current FScale; note 69 = 0x0258BF26 = 440 Hz at 48 kHz).
+    A device that stores all zeros means "keep the default" (`keep_default`). Writing zeros gives every note
+    frequency 0: you hear only the envelope as muffled thumps (bug of the first test synth, fixed).
   - `Velocity Tab` and `Aftertouch Tab`: if the host does not write them, the module uses its own tables
     `VelTab` / `AtTab` (seg_mod relocations of the input words).
   - `Channel Number`: 0..15, or 16 (bit 4) = omni.
@@ -278,7 +280,7 @@ On Linux this is a `set` op plus a `patch` op (sysmsg 6), the same mechanism as 
 - The module dereferences them twice. The input word points at a value word, and that value word holds the
   table's DM address.
 - The device stores the table contents in the atom pad (`PROCParam`, `DataElements`, items). Key-follow tables
-  (`MIDI2FP` "TIn") hold real data, and the MVC Tune table holds zeros.
+  (`MIDI2FP` "TIn") hold real data; the MVC Tune table holds zeros, which means "keep the module default".
 - base.dll uploads them when the atom is created. Host scripts (`MIDIVelocityTab.pep` …) rewrite them when the
   user edits a curve.
 
@@ -387,7 +389,7 @@ On Linux this is a `set` op plus a `patch` op (sysmsg 6), the same mechanism as 
 uses SCOPE DSP modules only, all unprotected, all on one DSP. That gives no sync slots, about 300 cycles and 16
 modules.
 ```
-SNC2MIDI (FIFO 32 words)  --MIDI-->  M_V_M16E "MVC Easy 16"  (SetVoices 4, Tune table = 128 zeros, channel 16 = omni)
+SNC2MIDI (FIFO 32 words)  --MIDI-->  M_V_M16E "MVC Easy 16"  (SetVoices 4, Tune Tab = module default, channel 16 = omni)
    for v in 0..3:  MVC out 68+v (Frequency v) -> MMOSC6.f        MMOSC6 Sel = 4 (as EZSynth)
                    MVC out 7+4v (Gate v)      -> ADSR-EG5.gate   ADSR A 0, D max, S 0, R 4800 (100 ms), slope 5
                    ADSR out0 (EG sync)        -> MVC in 8+v      ADSR out1 (level) -> LINVOL.vol
@@ -448,7 +450,7 @@ If there is no sound, read back these words with `get_value`: MVC note/gate (seg
 ## 6. Open points
 - Unlocking protection atoms (owner's decision, §4).
 - MVC frequency at 44.1 kHz (rescaled or 48 kHz-referenced?) [?]. Test the pitch of A4 at both rates.
-- Tune table semantics. Zero = equal temperament [L]. Verify with note 69 → 440 Hz.
+- Tune table semantics: RESOLVED, absolute phase increments, default tunedeftab (note 69 → 440 Hz checked on the DSP).
 - DSP → PC MIDI (Midi2snc + capture slot) and sample-timestamped PC → DSP (slot mode).
 - Velocity/aftertouch tables written by host scripts (`MIDIVelocityTab*.pep`). For now the device-stored values
   are used, or the module defaults when the stored values are zero.
