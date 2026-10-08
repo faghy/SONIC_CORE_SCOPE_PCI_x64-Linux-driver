@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QDockWid
 import pulsar_values
 import scope_device
 from pulsar_widgets import Knob
-from PySide6.QtWidgets import QPushButton
+from PySide6.QtWidgets import QComboBox, QPushButton
 
 SOCKET = os.environ.get("PULSARD_SOCKET", "/run/pulsard.sock")
 LAYOUT_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
@@ -439,19 +439,22 @@ class DevParam:
         self.hi = q["max"] if q.get("max") is not None else 1.0
         self.default = q["default"] if q.get("default") is not None else self.lo
 
+        curve = q.get("curve") if q.get("curve") in ("lin", "log", "db") else "lin"
+        self._lin = pulsar_values.Param(self.name, self.unit, self.lo, self.hi, self.default, curve)
+
     def from_t(self, t):
         if self.spec.get("knob"):
             v = scope_device.knob_to_display(self.spec, min(max(t, 0.0), 1.0))
             if v is not None:
                 return v
-        return self.lo + t * (self.hi - self.lo)
+        return self._lin.from_t(t)
 
     def to_t(self, v):
         if self.spec.get("knob"):
             t = scope_device.display_to_knob(self.spec, v)
             if t is not None:
                 return t
-        return 0.0 if self.hi == self.lo else (v - self.lo) / (self.hi - self.lo)
+        return self._lin.to_t(v)
 
     def fmt(self, v):
         fmt = self.q.get("format")
@@ -473,12 +476,28 @@ class DevicePanel(QDialog):
         self.win, self.node = win, node
         self.setWindowTitle(node.desc.get("title") or node.id)
         lay = QVBoxLayout(self)
+        presets = []
+        if not str(node.desc.get("file", "")).startswith("builtin:"):
+            try:
+                presets = request({"cmd": "presets", "id": node.id}).get("presets", [])
+            except DaemonError:
+                presets = []
+        if presets:
+            row = QHBoxLayout()
+            row.addWidget(QLabel("Preset:"))
+            self.preset_box = QComboBox()
+            self.preset_box.addItem("(choose a preset)")
+            for p in presets:
+                self.preset_box.addItem(p["name"] + ("  [%s]" % p["category"] if p.get("category") else ""), p["index"])
+            self.preset_box.activated.connect(self.load_preset)
+            row.addWidget(self.preset_box, 1)
+            lay.addLayout(row)
         grid = QGridLayout()
         lay.addLayout(grid)
         k = 0
         for q in node.desc.get("params", []):
             cur = q.get("value") if q.get("value") is not None else q.get("default")
-            if q.get("discrete") and (q.get("max") or 0) - (q.get("min") or 0) <= 1:
+            if q.get("discrete") and (q.get("max") or 0) - (q.get("min") or 0) <= 1 and q.get("unit", "") == "":
                 b = QPushButton(q["name"])
                 b.setCheckable(True)
                 b.setChecked(bool(cur))
@@ -497,6 +516,22 @@ class DevicePanel(QDialog):
             node.desc.get("file", ""), node.desc.get("modules", 0), node.desc.get("dsp"), node.desc.get("cycles", 0)))
         info.setStyleSheet("color: #888")
         lay.addWidget(info)
+
+    def load_preset(self, i):
+        idx = self.preset_box.itemData(i)
+        if idx is None:
+            return
+        if self.win.call({"cmd": "load_preset", "id": self.node.id, "preset": idx}) is None:
+            return
+        self.win.mark_dirty()
+        self.win.refresh()
+        node = self.win.nodes.get(self.node.id)
+        if node is not None:                    # reopen with the preset's values on the knobs
+            p = DevicePanel(self.win, node)
+            p.move(self.pos())
+            p.show()
+            p.preset_box.setCurrentIndex(i)
+        self.close()
 
 
 class KnobPanel(QDialog):

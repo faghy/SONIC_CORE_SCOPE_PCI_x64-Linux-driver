@@ -108,6 +108,13 @@ struct pulsar_card {
 	u8 board_rev;
 	int irq;
 
+	/* host-RAM delay lines (pulsar_delay.c); list and slot_end are protected by reg_lock */
+	struct list_head delays;
+	struct mutex delay_mutex;
+	u32 delay_next_handle;
+	u32 delay_last_block;
+	unsigned int slot_end;            /* slot-table terminator index */
+
 	/* IRQ statistics, exported via hwdep for bring-up debugging */
 	atomic_t irq_count;
 	u32 last_int_status;
@@ -122,5 +129,15 @@ int pulsar_dsp_set_value(struct pulsar_card *chip, unsigned int dsp, u32 addr, u
 int pulsar_dsp_send(struct pulsar_card *chip, const u32 *words, unsigned int n);
 int pulsar_mixer_set_controls(struct pulsar_card *chip, const struct pulsar_controls *pc);
 int pulsar_hwdep_create(struct pulsar_card *chip);
+
+/* pulsar_delay.c (docs/pc_delay.md) */
+void pulsar_delay_init(struct pulsar_card *chip);
+int pulsar_delay_alloc(struct pulsar_card *chip, struct pulsar_delay_alloc *a);
+int pulsar_delay_free(struct pulsar_card *chip, u32 handle);
+int pulsar_delay_param(struct pulsar_card *chip, const struct pulsar_delay_param *p);
+void pulsar_delay_free_all(struct pulsar_card *chip);
+void pulsar_delay_interrupt(struct pulsar_card *chip);
+unsigned int pulsar_delay_max_slot(struct pulsar_card *chip);
+void pulsar_delay_restore_entries(struct pulsar_card *chip);
 
 #endif /* _PULSAR_H_ */

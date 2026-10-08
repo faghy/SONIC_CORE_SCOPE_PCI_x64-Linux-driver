@@ -46,6 +46,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import pulsar_loader as pl       # noqa: E402
 import pulsar_modules as pm      # noqa: E402
+import pulsar_delay as pdl       # noqa: E402  (host delay atoms of SCOPE devices, docs/pc_delay.md)
 
 CORE_CLOCK = 60000000            # pluto coreClock (docs/clock_rate.md)
 CYCLE_RESERVE = 0.25             # keep 25 % of every sample period for the OS
@@ -53,6 +54,11 @@ CYCLE_RESERVE = 0.25             # keep 25 % of every sample period for the OS
 
 class GraphError(Exception):
     pass
+
+
+def cycles(cls):
+    """Sync cycles per sample of a module class (the descriptor word carries flags in its high bits)."""
+    return cls.syncCycles & 0xFFFF
 
 
 def _s32(v):
@@ -66,14 +72,26 @@ def _survey_one(path, dsp_dir, devices_dir):
         p = sd.plan(path, dsp_dir)
     except Exception:
         return None
-    if not p.get("complete") or p.get("needs_midi") or p.get("license_atoms"):
+    if not p.get("complete") or p.get("needs_midi"):
         return None
+    import pulsar_license as plic
+    lic = set()
+    for m in p["modules"]:
+        if m.get("kind") == "pc_delay" or not m.get("dsp_file"):
+            continue
+        try:
+            cls = pm.ModuleClass(os.path.join(dsp_dir, m["dsp_file"]))
+        except Exception:
+            continue
+        if plic.needs_unlock(cls):
+            lic.add(tuple(plic.module_seg_id(cls)))
     rel = os.path.relpath(path, devices_dir)
     return {"file": rel, "name": p["name"], "category": os.path.dirname(rel), "cycles": p["dsp_cycles"],
             "modules": len(p["modules"]),
             "inputs": [q["name"] for q in p["ports"] if q["dir"] == "in"],
             "outputs": [q["name"] for q in p["ports"] if q["dir"] == "out"],
-            "params": [q["name"] for q in p["params"] if not q.get("hidden") and q.get("targets")]}
+            "params": [q["name"] for q in p["params"] if not q.get("hidden") and q.get("targets")],
+            "pc_delay": bool(p.get("pc_delays")), "licensed": [list(x) for x in sorted(lic)]}
 
 
 class Node:
@@ -81,6 +99,7 @@ class Node:
         self.id, self.kind, self.title, self.mod, self.dsp, self.fixed = nid, kind, title, mod, dsp, fixed
         self.parent = None          # device node id for the DSP modules inside a device
         self.dev = None             # device data (kind == "device")
+        self.pcd = None             # pulsar_delay.PcDelay (kind == "pc_delay", inside a device)
 
     def _ports(self, direction):
         names = self.dev["in_names" if direction == "in" else "out_names"]
@@ -91,6 +110,8 @@ class Node:
     def inputs(self):
         if self.kind == "device":
             return self._ports("in")
+        if self.kind == "pc_delay":
+            return self.pcd.inputs()
         if self.kind == "pc_play":
             return []
         if self.kind == "pc_rec":
@@ -101,6 +122,8 @@ class Node:
     def outputs(self):
         if self.kind == "device":
             return self._ports("out")
+        if self.kind == "pc_delay":
+            return self.pcd.outputs()
         if self.kind == "pc_play":
             return [{"index": i, "name": n, "sync": True} for i, n in enumerate(("L", "R"))]
         if self.kind == "pc_rec":
@@ -114,13 +137,14 @@ class Node:
              "inputs": self.inputs(), "outputs": self.outputs()}
         if self.mod is not None:
             d.update(file=self.mod.cls.name, name=self.mod.cls.short, long=self.mod.cls.long,
-                     cycles=self.mod.cls.syncCycles)
+                     cycles=cycles(self.mod.cls))
         if self.dev is not None:
             pl_ = self.dev["plan"]
             d.update(file=self.dev["file"], cycles=pl_["dsp_cycles"], modules=len(self.dev["inner"]),
                      params=[dict(name=q["name"], unit=q.get("unit") or "", min=q.get("min"), max=q.get("max"),
                                   default=q.get("default"), curve=q.get("curve"), discrete=bool(q.get("discrete")),
-                                  format=q.get("display_format"), value=self.dev["params"].get(q["name"]),
+                                  format=q.get("display_format") or q.get("format"),
+                                  value=self.dev["params"].get(q["name"]),
                                   spec={k: q.get(k) for k in ("knob", "display", "val_min", "val_max",
                                                                "val_default", "control")})
                              for q in self.dev["params_list"]])
@@ -139,6 +163,9 @@ class Graph:
         self._catalog = None
         self._devices = None
         self.devices_dir = None
+        self.midi_dsp = None
+        self.lic = None            # pulsar_license.License (user's own key file), None = no licence
+        self.unlock = None         # PlutoDsp.load unlock hook (uC computes the magic word, docs/presets_license.md)
         self.add_node("pc_play", "PC Playback", dsp=None, fixed=True, nid="pc_play")
         self.add_node("pc_rec", "PC Record", dsp=None, fixed=True, nid="pc_rec")
         h = handles
@@ -162,6 +189,8 @@ class Graph:
         self.default_wires = dict(self.wires)
         self.gui = {}                                        # opaque GUI data (layout), kept in projects
         self.state_file = None                               # autosave target (set by main)
+        self.host_words = pdl.HostWords()                    # BAR dwords for DSP async -> host delay times
+        self._pc_delay_ok = None
 
     # ---- bookkeeping
     def add_node(self, kind, title, mod=None, dsp=None, fixed=False, nid=None):
@@ -180,7 +209,7 @@ class Graph:
         budget = int(CORE_CLOCK / self.rate * (1 - CYCLE_RESERVE))
         out = []
         for d in self.rack.dsp:
-            cyc = sum(m.cls.syncCycles for m in d.modules)
+            cyc = sum(cycles(m.cls) for m in d.modules)
             out.append({"dsp": d.dspno, "modules": len(d.modules), "cycles": cyc, "budget": budget,
                         "pm_free": sum(n for _, n in d.pm.free_ranges()),
                         "dm_free": sum(n for _, n in d.dm.free_ranges())})
@@ -222,7 +251,7 @@ class Graph:
             except Exception:                       # libraries, other boards, unsupported heaps
                 continue
             fixed = (c.flags >> 17) & 0xF
-            cat.append({"file": fn, "name": c.short, "long": c.long, "cycles": c.syncCycles,
+            cat.append({"file": fn, "name": c.short, "long": c.long, "cycles": cycles(c),
                         "fixed_dsp": fixed - 1 if fixed else None,
                         "inputs": [{"name": p.short, "long": p.long, "sync": p.sync, "type": p.type,
                                     "min": _s32(p.min), "max": _s32(p.max)} for p in c.pads if p.kind == "in"],
@@ -244,11 +273,11 @@ class Graph:
         budget = CORE_CLOCK / self.rate * (1 - CYCLE_RESERVE)
         best = None
         for d in (2, 3, 4, 5, 1, 0):                # keep DSP0/1 (analog I/O) for last
-            cyc = sum(m.cls.syncCycles for m in self.rack.dsp[d].modules)
-            if cyc + cls.syncCycles <= budget and (best is None or cyc < best[1]):
+            cyc = sum(cycles(m.cls) for m in self.rack.dsp[d].modules)
+            if cyc + cycles(cls) <= budget and (best is None or cyc < best[1]):
                 best = (d, cyc)
         if best is None:
-            raise GraphError("no DSP has %d free cycles for %s" % (cls.syncCycles, cls.name))
+            raise GraphError("no DSP has %d free cycles for %s" % (cycles(cls), cls.name))
         return best[0]
 
     def load(self, file, dsp=None, name=None):
@@ -256,7 +285,12 @@ class Graph:
         cls = pm.ModuleClass(path)
         if dsp is None:
             dsp = self._pick_dsp(cls)
-        mod, ops = self.rack.load(path, int(dsp))
+        try:
+            mod, ops = self.rack.load(path, int(dsp), unlock=self.unlock)
+        except Exception as e:
+            if type(e).__name__ == "LicenseError":
+                raise GraphError("no licence for %s: %s" % (os.path.basename(path), e))
+            raise
         self.execute(ops)
         return self.add_node("module", name or cls.long or cls.short, mod)
 
@@ -264,7 +298,7 @@ class Graph:
     def _src_ep(self, src, out, depth=0):
         """Real source (node id, output) of output `out` of node `src`, or None (silence)."""
         n = self.node(src)
-        if n.kind in ("pc_play", "module"):
+        if n.kind in ("pc_play", "module", "pc_delay"):
             if out >= len(n.outputs()):
                 raise GraphError("%s has no output %d" % (src, out))
             return (src, out)
@@ -287,7 +321,7 @@ class Graph:
 
     def _dst_eps(self, dst, inp):
         n = self.node(dst)
-        if n.kind == "module":
+        if n.kind in ("module", "pc_delay"):
             if inp >= len(n.inputs()):
                 raise GraphError("%s has no input %d" % (dst, inp))
             return [(dst, inp)]
@@ -302,8 +336,13 @@ class Graph:
     def _link(self, ep, dnid, i):
         """Wire source endpoint ep (or silence when None) to input i of module dnid."""
         dn = self.nodes[dnid]
+        if dn.kind == "pc_delay":
+            self._link_pc_delay(ep, dnid, i)
+            return
         if ep is None:
             ops = self.rack.disconnect(dn.mod, i)
+        elif self.nodes[ep[0]].kind == "pc_delay":          # tap k -> PC window slot (broadcast)
+            ops = self.rack.dsp[dn.dsp].link_input(dn.mod, i, self.nodes[ep[0]].pcd.tap_addr(ep[1]))
         elif ep[0] == "pc_play":
             if ep[1] not in (0, 1):
                 raise GraphError("pc_play has outputs 0 and 1")
@@ -346,6 +385,14 @@ class Graph:
 
     def set_value(self, nid, inp, value):
         n = self.node(nid)
+        if n.kind == "pc_delay":
+            try:
+                n.pcd.set_pad(self.b.bar, inp, int(value))
+            except pdl.DelayError as e:
+                raise GraphError(str(e))
+            self.wires.pop((nid, inp), None)
+            self.values[(nid, inp)] = int(value) & 0xFFFFFFFF
+            return
         if n.kind != "module":
             raise GraphError("%s has no settable inputs" % nid)
         if n.fixed:
@@ -371,6 +418,8 @@ class Graph:
                 inner = n.dev["inner"].get(key)
                 if inner in self.nodes:
                     self.unload(inner, _inner=True)
+        elif n.kind == "pc_delay":
+            self._free_pc_delay(n)
         else:
             self.execute(self.rack.unload(n.mod))
         for k in [k for k in self.values if k[0] == nid]:
@@ -384,6 +433,97 @@ class Graph:
             raise GraphError("device file not found: %s" % file)
         return path
 
+    # ---- MIDI from the PC (ALSA sequencer client "Pulsar2 MIDI" -> SNC2MIDI FIFO, docs/midi_synths.md)
+    def start_midi(self, dsp=2):
+        import pulsar_midi as pmid
+        mod, ops, info = pmid.midi_source_ops(self.rack, dsp, self.dsp_dir)
+        self.execute(ops)
+        nid = self.add_node("module", "PC MIDI In", mod, fixed=True, nid="pc_midi")
+        self.midi_fifo = pmid.ScopeMidiFifo(self.b, info, lock=self.lock)
+        try:
+            self.midi_bridge = pmid.MidiBridge(self.midi_fifo, "Pulsar2 MIDI")
+        except Exception as e:                     # no ALSA sequencer (e.g. dry run in a container)
+            print("pulsard: MIDI client unavailable: %s" % e, flush=True)
+            return nid
+        threading.Thread(target=self.midi_bridge.serve, daemon=True, name="midi").start()
+        print("pulsard: ALSA MIDI client 'Pulsar2 MIDI' ready (PC MIDI In on DSP%d)" % dsp, flush=True)
+        return nid
+
+    # built-in instruments made of unprotected SCOPE modules (factory synths carry copy-protection atoms)
+    BUILTINS = {"builtin:test_synth": "Pulsar Test Synth"}
+
+    def builtin_entries(self):
+        return [{"file": "builtin:test_synth", "name": "Pulsar Test Synth (4 voices)", "category": "Instruments",
+                 "cycles": 0, "modules": 0, "inputs": ["MIDI In"], "outputs": ["Out"],
+                 "params": ["Attack", "Decay", "Sustain", "Release", "Waveform", "Volume"]}]
+
+    def _build_test_synth(self, dev_id, dsp, voices=4):
+        import pulsar_midi as pmid
+        import scope_device as sd
+        inner, keys = {}, []
+
+        def mod(file, key):
+            nid = self.load(file, dsp, key)
+            self.nodes[nid].parent = dev_id
+            inner[key] = nid
+            keys.append(key)
+            return self.nodes[nid].mod
+
+        mvc = mod(pmid.MVC_EASY16, "MVC")
+        mix = mod("16MIX.dsp", "Mixer")
+        lay_mvc, lay_mix = sd.voice_layout(mvc.cls), sd.voice_layout(mix.cls)
+        voices = max(1, min(voices, lay_mvc["n"], lay_mix["n"]))
+        ops = pmid.set_voices_ops(self.rack, mvc, voices) + pmid.set_voices_ops(self.rack, mix, voices)
+        ops += pmid.table_ops(self.rack, mvc, 1, [0] * 128, 128, "MVC tune table (equal temperament)")
+        ops += self.rack.set_in_pad(mvc, 3, 16)                                   # omni
+        ops += self.rack.set_in_pad(mix, 0, 0x7FFFFFFF // voices)                 # master gain 1/voices
+        self.execute(ops)
+        out = mod("LINVOL.dsp", "Out")
+        for v in range(voices):
+            osc = mod("MMOSC6.dsp", "Osc%d" % v)
+            eg = mod("ADSR-EG5.dsp", "Env%d" % v)
+            vca = mod("LINVOL.dsp", "VCA%d" % v)
+            ops = self.rack.connect(mvc, sd.voice_out_pad(lay_mvc, 8, v), osc, 0)      # frequency
+            ops += self.rack.connect(mvc, sd.voice_out_pad(lay_mvc, 7, v), eg, 0)      # gate
+            ops += self.rack.connect(eg, 0, mvc, sd.voice_in_pad(lay_mvc, 8, v))       # voice release sync
+            ops += self.rack.connect(osc, 0, vca, 0)
+            ops += self.rack.connect(eg, 1, vca, 1)
+            ops += self.rack.connect(vca, 0, mix, sd.voice_in_pad(lay_mix, 1, v))
+            ops += self.rack.set_in_pad(eg, 8, 5)                                   # slope
+            self.execute(ops)
+        self.execute(self.rack.connect(mix, 0, out, 0))
+        envs = [k for k in keys if k.startswith("Env")]
+        oscs = [k for k in keys if k.startswith("Osc")]
+        ms = lambda i: {"kind": "ms", "keys": envs, "in": i}                     # noqa: E731
+        params = [
+            {"name": "Attack", "unit": "ms", "min": 1, "max": 5000, "default": 5, "curve": "log", "b": ms(4)},
+            {"name": "Decay", "unit": "ms", "min": 1, "max": 5000, "default": 300, "curve": "log", "b": ms(5)},
+            {"name": "Sustain", "unit": "%", "min": 0, "max": 100, "default": 70, "curve": "lin",
+             "b": {"kind": "pct", "keys": envs, "in": 6}},
+            {"name": "Release", "unit": "ms", "min": 1, "max": 10000, "default": 250, "curve": "log", "b": ms(7)},
+            {"name": "Waveform", "unit": "", "min": 0, "max": 5, "default": 4, "curve": "lin", "discrete": True,
+             "b": {"kind": "int", "keys": oscs, "in": 1}},
+            {"name": "Volume", "unit": "dB", "min": -60, "max": 0, "default": -20, "curve": "db",
+             "b": {"kind": "db", "keys": ["Out"], "in": 1}},
+        ]
+        plan = {"name": "Pulsar Test Synth", "order": keys, "modules": [], "wires": [], "consts": [],
+                "dsp_cycles": sum(cycles(self.nodes[n].mod.cls) for n in inner.values()), "params": params,
+                "ports": [{"name": "MIDI In", "dir": "in", "sync": False, "midi": True,
+                           "target": ["MVC", 0], "targets": [["MVC", 0]]},
+                          {"name": "Out", "dir": "out", "sync": True, "target": ["Out", 0], "targets": [["Out", 0]]}]}
+        return plan, inner
+
+    def _builtin_raw(self, q, value):
+        b = q["b"]
+        if b["kind"] == "ms":
+            return [(k, b["in"], int(round(value * self.rate / 1000.0))) for k in b["keys"]]
+        if b["kind"] == "pct":
+            return [(k, b["in"], min(0x7FFFFFFF, int(value / 100.0 * 0x7FFFFFFF))) for k in b["keys"]]
+        if b["kind"] == "db":
+            return [(k, b["in"], 0 if value <= q["min"] else min(0x7FFFFFFF, int(10 ** (value / 20.0) * 0x7FFFFFFF)))
+                    for k in b["keys"]]
+        return [(k, b["in"], int(round(value)) & 0xFFFFFFFF) for k in b["keys"]]
+
     def _plan(self, path, switch_values=None):
         import scope_device as sd
         p = sd.plan(path, self.dsp_dir, switch_values or None)
@@ -392,13 +532,28 @@ class Graph:
                                                             "; ".join(p.get("unsupported") or ["incomplete"])))
         if p.get("needs_midi"):
             raise GraphError("%s needs MIDI, not supported yet" % os.path.basename(path))
-        if p.get("license_atoms"):
-            raise GraphError("%s uses licensed modules (%s), not supported" %
-                             (os.path.basename(path), ", ".join(sorted(set(p["license_atoms"])))))
+        missing = self.unlicensed(p)
+        if missing:
+            raise GraphError("%s needs a SCOPE licence you do not have: %s" % (os.path.basename(path), ", ".join(missing)))
         return p
+
+    def unlicensed(self, p):
+        """Names of the plan's licensed modules (magicProt + seg_id) not covered by the user's key file."""
+        import pulsar_license as plic
+        out = []
+        for m in p["modules"]:
+            if m.get("kind") == "pc_delay" or not m.get("dsp_file"):
+                continue
+            cls = pm.ModuleClass(os.path.join(self.dsp_dir, m["dsp_file"]))
+            if plic.needs_unlock(cls):
+                if self.lic is None or self.lic.find(plic.module_seg_id(cls)) is None:
+                    out.append(m["dsp_file"])
+        return sorted(set(out))
 
     def load_device(self, file, dsp=None, title=None, params=None):
         import scope_device as sd
+        if file in self.BUILTINS:
+            return self._load_builtin(file, dsp, title, params)
         path = self._device_path(file)
         p = self._plan(path)
         free = [m for m in p["modules"] if m["fixed_dsp"] is None]
@@ -407,9 +562,13 @@ class Graph:
             need = sum(m["cycles"] for m in free)
             best = None
             for d in (2, 3, 4, 5, 1, 0):
-                cyc = sum(m.cls.syncCycles for m in self.rack.dsp[d].modules)
+                cyc = sum(cycles(m.cls) for m in self.rack.dsp[d].modules)
                 if cyc + need <= budget and (best is None or cyc < best[1]):
                     best = (d, cyc)
+            # many host delay lines = many capture slots: only DSP5's sync block can grow past 11 (pc_delay.md §6)
+            if len(p.get("pc_delays") or []) > 8 and \
+                    sum(cycles(m.cls) for m in self.rack.dsp[5].modules) + need <= budget:
+                best = (5, 0)
             if best is None:
                 raise GraphError("no DSP has %d free cycles for %s" % (need, p["name"]))
             dsp = best[0]
@@ -419,11 +578,17 @@ class Graph:
         try:
             for key in p["order"]:
                 m = next(x for x in p["modules"] if x["key"] == key)
-                nid = self.load(m["dsp_file"], m["fixed_dsp"] if m["fixed_dsp"] is not None else dsp,
-                                key.split("/")[-1])
+                if m.get("kind") == "pc_delay":
+                    nid = self._new_pc_delay(m, key)
+                else:
+                    nid = self.load(m["dsp_file"], m["fixed_dsp"] if m["fixed_dsp"] is not None else dsp,
+                                    key.split("/")[-1])
                 self.nodes[nid].parent = dev_id
                 inner[key] = nid
+            self._setup_pc_delays(p, inner)      # before the wires: sources move to comm slots
             for w in p["wires"]:
+                if self.nodes[inner[w["dst_key"]]].kind == "pc_delay" and w["in"] == 0:
+                    continue                     # done by _setup_pc_delays
                 self._link((inner[w["src_key"]], w["out"]), inner[w["dst_key"]], w["in"])
             for c in p["consts"]:
                 self.set_value(inner[c["key"]], c["in"], sd.const_raw(c, self.rate))
@@ -448,6 +613,22 @@ class Graph:
             self.set_param(dev_id, name, v)
         return dev_id
 
+    def _load_builtin(self, file, dsp, title, params):
+        if dsp is None:
+            dsp = self.midi_dsp if self.midi_dsp is not None else 2
+        dev_id = "n%d" % self._next
+        self._next += 1
+        plan, inner = self._build_test_synth(dev_id, int(dsp))
+        node = Node(dev_id, "device", title or self.BUILTINS[file], dsp=int(dsp))
+        node.dev = {"file": file, "path": file, "plan": plan, "switch_values": {}, "inner": inner,
+                    "in_names": ["MIDI In"], "out_names": ["Out"], "params_list": plan["params"], "params": {}}
+        self.nodes[dev_id] = node
+        for q in plan["params"]:
+            self.set_param(dev_id, q["name"], (params or {}).get(q["name"], q["default"]))
+        if "pc_midi" in self.nodes:                                   # play it right away from the PC
+            self.connect("pc_midi", 0, dev_id, 0)
+        return dev_id
+
     def set_param(self, dev_id, name, value):
         import scope_device as sd
         n = self.node(dev_id)
@@ -458,7 +639,8 @@ class Graph:
             raise GraphError("%s has no parameter %r" % (dev_id, name))
         value = float(value)
         switched = False
-        for key, inp, raw in sd.targets_raw(q, value, self.rate):
+        rows = self._builtin_raw(q, value) if "b" in q else sd.targets_raw(q, value, self.rate)
+        for key, inp, raw in rows:
             if inp == "switch":
                 if n.dev["switch_values"].get(key) != raw:
                     n.dev["switch_values"][key] = raw
@@ -468,6 +650,32 @@ class Graph:
         if switched:
             self._replan(n)
         n.dev["params"][name] = value
+
+    def presets(self, dev_id):
+        import scope_device as sd
+        n = self.node(dev_id)
+        if n.kind != "device" or n.dev["file"] in self.BUILTINS:
+            return []
+        return [{"index": i, "name": q["name"], "source": q.get("source"), "category": q.get("category")}
+                for i, q in enumerate(sd.presets(n.dev["path"]))]
+
+    def load_preset(self, dev_id, preset):
+        import scope_device as sd
+        n = self.node(dev_id)
+        if n.kind != "device" or n.dev["file"] in self.BUILTINS:
+            raise GraphError("%s has no presets" % dev_id)
+        r = sd.preset_values(n.dev["path"], preset, rate=self.rate, dsp_dir=self.dsp_dir, the_plan=n.dev["plan"])
+        names = {q["name"] for q in n.dev["params_list"]}
+        switch_first = [k for k in r["params"] if k in names and
+                        any(t.get("kind") == "switch" for q in n.dev["params_list"] if q["name"] == k for t in q["targets"])]
+        for k in switch_first + [k for k in r["params"] if k not in switch_first]:
+            if k in names:
+                self.set_param(dev_id, k, r["params"][k])
+        for w in r.get("raw", []):
+            if w.get("key") in n.dev["inner"]:
+                self.set_value(n.dev["inner"][w["key"]], w["in"], w["word"])
+        n.dev["preset"] = r.get("name")
+        return {"name": r.get("name"), "warnings": r.get("check", [])}
 
     def _replan(self, n):
         """A routing switch moved: apply the internal wire diff, then re-link the device's ports."""
@@ -495,23 +703,32 @@ class Graph:
         self._refresh_from(n.id)
 
     def devices(self, refresh=False):
-        """Usable SCOPE devices (complete plan, no MIDI, no licensed modules), cached."""
+        ok = [d for d in self._scope_devices(refresh)
+              if all(self.lic is not None and self.lic.find(tuple(x)) is not None for x in d.get("licensed", []))]
+        return self.builtin_entries() + ok
+
+    def _scope_devices(self, refresh=False):
+        """Usable SCOPE devices (complete plan, no MIDI), cached; devices() drops the ones the licence does not cover."""
         if self._devices is not None and not refresh:
-            return self._devices
-        cache = "/var/cache/pulsard/devices-v1.json"
+            return self._devices_usable()
+        cache = "/var/cache/pulsard/devices-v3.json"
         if not refresh and os.path.exists(cache):
             try:
                 with open(cache) as f:
                     self._devices = json.load(f)
-                return self._devices
+                return self._devices_usable()
             except (OSError, ValueError):
                 pass
         files = []
         for root, _, names in os.walk(self.devices_dir or "/nonexistent"):
             files += [os.path.join(root, fn) for fn in names if fn.lower().endswith(".dev")]
+        # "spawn", not fork: pulsard is multi-threaded (MIDI client, socket server) and forked workers deadlock
         import multiprocessing
-        with multiprocessing.Pool(max(1, min(6, (os.cpu_count() or 2) - 1))) as pool:
-            rows = pool.starmap(_survey_one, [(f, self.dsp_dir, self.devices_dir) for f in sorted(files)])
+        from concurrent.futures import ProcessPoolExecutor
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max(1, min(6, (os.cpu_count() or 2) - 1)), mp_context=ctx) as ex:
+            rows = list(ex.map(_survey_one, sorted(files), [self.dsp_dir] * len(files),
+                               [self.devices_dir] * len(files)))
         self._devices = [r for r in rows if r]
         try:
             os.makedirs(os.path.dirname(cache), exist_ok=True)
@@ -519,7 +736,78 @@ class Graph:
                 json.dump(self._devices, f)
         except OSError:
             pass
-        return self._devices
+        return self._devices_usable()
+
+    # ---- host delay lines ("PC Master 4k/32k Delay", "PC 256k Delay", "PC Early Reflection"), docs/pc_delay.md
+    def _devices_usable(self):
+        if self._pc_delay_ok is None:
+            self._pc_delay_ok = pdl.supported(self.b.bar)
+        return [r for r in self._devices if self._pc_delay_ok or not r.get("pc_delay")]
+
+    def _new_pc_delay(self, m, key):
+        nid = self.add_node("pc_delay", key.split("/")[-1], dsp=None)
+        self.nodes[nid].pcd = pdl.PcDelay(m["pc_delay"], key.split("/")[-1])
+        return nid
+
+    def _setup_pc_delays(self, p, inner):
+        """Move each delay input's source to a comm slot (capture side of the host ring), seed the delays from
+        the saved constants and let the kernel allocate the rings and tap slots."""
+        import scope_device as sd
+        for info in p.get("pc_delays") or []:
+            n = self.nodes[inner[info["key"]]]
+            src_key, out = info["input"]
+            smod = self.nodes[inner[src_key]].mod
+            j = out - smod.cls.numAsyncOut
+            if j < 0:
+                raise GraphError("%s: delay input fed by an async output" % info["key"])
+            addr, ops = self.rack.dsp[smod.dsp].alloc_sync_output(smod, j)
+            self.execute(ops)
+            for c in p["consts"]:
+                if c["key"] == info["key"]:
+                    n.pcd.set_pad(None, c["in"], sd.const_raw(c, self.rate))
+            try:
+                n.pcd.allocate(self.b.bar, addr, max(info["taps_used"] or [0]) + 1)
+            except pdl.DelayError as e:
+                raise GraphError("%s: %s" % (info["key"], e))
+            n.pcd_input = (inner[src_key], out)
+
+    def _link_pc_delay(self, ep, dnid, i):
+        n = self.nodes[dnid]
+        role = pdl.pad_role(n.pcd.spec, i)
+        if role[0] == "in":
+            if ep is not None and tuple(ep) != getattr(n, "pcd_input", None):
+                raise GraphError("%s: the input of a PC delay cannot be rewired at runtime" % dnid)
+            return
+        old = n.pcd.sources.pop(i, None)
+        if old is not None:                      # detach the previous DSP source
+            smod, k, word = old
+            self.execute(pdl.unexport_host(self.rack, smod, k, word))
+            n.pcd.set_source(self.b.bar, i, None)
+            self.host_words.release(word)
+        if ep is None:
+            return
+        src = self.nodes[ep[0]]
+        if src.kind != "module" or ep[1] >= src.mod.cls.numAsyncOut:
+            raise GraphError("%s: pad %d takes a value or a DSP async output only" % (dnid, i))
+        word = self.host_words.alloc()
+        try:
+            n.pcd.set_source(self.b.bar, i, word)
+        except pdl.DelayError as e:
+            self.host_words.release(word)
+            raise GraphError(str(e))
+        n.pcd.sources[i] = (src.mod, ep[1], word)
+        self.execute(pdl.export_to_host(self.rack, src.mod, ep[1], word))
+
+    def _free_pc_delay(self, n):
+        for i in list(n.pcd.sources):
+            smod, k, word = n.pcd.sources.pop(i)
+            if smod.loaded:
+                self.execute(pdl.unexport_host(self.rack, smod, k, word))
+            self.host_words.release(word)
+        try:
+            n.pcd.free(self.b.bar)
+        except pdl.DelayError as e:
+            raise GraphError(str(e))
 
 
     # ---- projects
@@ -592,7 +880,7 @@ class Graph:
 
 
 MUTATING = {"load", "unload", "connect", "disconnect", "set", "reset", "load_project", "set_gui", "load_device",
-            "set_param"}
+            "set_param", "load_preset"}
 
 
 class Handler(socketserver.StreamRequestHandler):
@@ -628,6 +916,13 @@ class Handler(socketserver.StreamRequestHandler):
                         res = {}
                     elif cmd == "load_device":
                         res = {"id": g.load_device(req["file"], req.get("dsp"), req.get("name"), req.get("params"))}
+                    elif cmd == "presets":
+                        res = {"presets": g.presets(req["id"])}
+                    elif cmd == "load_preset":
+                        res = g.load_preset(req["id"], req["preset"])
+                    elif cmd == "license":
+                        res = {"entries": [] if g.lic is None else
+                               [e.describe(g.lic.board_sno, g.lic.uc_info) for e in g.lic.entries]}
                     elif cmd == "set_param":
                         g.set_param(req["id"], req["name"], req["value"])
                         res = {}
@@ -678,6 +973,7 @@ def main():
     ap.add_argument("--volume", type=float, default=-30.0)
     ap.add_argument("--monitor", type=float, default=-12.0)
     ap.add_argument("--no-monitor", action="store_true")
+    ap.add_argument("--no-midi", action="store_true", help="no ALSA MIDI client / PC MIDI In node")
     ap.add_argument("--state", default=None,
                     help="autosave of the current rack, restored at start ('' disables; default "
                          "/var/lib/snd-pulsar/current-project.json, none with --dry-run)")
@@ -697,6 +993,24 @@ def main():
         print("pulsard: card boot failed", file=sys.stderr)
         return 1
     graph = Graph(b, a.dsp_dir, a.rate, handles)
+    try:
+        import pulsar_license as plic
+        lic_path = os.environ.get("PULSAR_LICENSE") or "/var/lib/snd-pulsar/license"
+        if plic.key_files(lic_path) and getattr(b, "uc_serial", None) is not None:
+            graph.lic = plic.License(lic_path, b.uc_serial, b.uc_info)
+            syms = {k: graph.rack.dsp[plic.UC_DSP].sym(k) for k in ("ucMagicDest", "ucDataOut", "ucBytePosOut", "ucCmdOut")}
+            graph.unlock = plic.unlock_hook(graph.lic, syms)
+            print("pulsard: SCOPE licence loaded (%d valid entries)" % sum(1 for e in graph.lic.entries if e.valid),
+                  flush=True)
+    except Exception as e:
+        print("pulsard: licence not loaded: %s" % e, flush=True)
+    if not a.no_midi:
+        try:
+            graph.midi_dsp = 2
+            graph.start_midi(graph.midi_dsp)
+        except Exception as e:
+            graph.midi_dsp = None
+            print("pulsard: MIDI input disabled: %s" % e, flush=True)
     for cand in (a.devices_dir, "/var/lib/snd-pulsar/devices",
                  os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(a.dsp_dir))), "Devices")):
         if cand and os.path.isdir(cand):

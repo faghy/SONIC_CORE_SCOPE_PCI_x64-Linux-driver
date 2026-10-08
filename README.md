@@ -26,7 +26,11 @@ SHARC ADSP-21065L). It was written by reverse engineering the Windows SCOPE 5.1 
 | `.deb` package (DKMS driver, service, tools, GUI) | **working** |
 | SCOPE devices (`.dev`): 36 effects (EQ, filters, dynamics, distortion, phaser, flanger, chorus…) as one block with knobs in real units | **working** |
 | SCOPE-style knobs (Hz, dB…) for devices and common modules, correct float/integer pad encoding | **working** |
-| Synths (MIDI, voice manager), delays/reverbs (PC-side atoms), licensed "Effect Package" devices, ADAT/S/PDIF/MIDI | to do |
+| Delays and reverbs (PC-side delay lines in host RAM, new kernel ioctls) | **working** in simulation, hardware test in progress |
+| Licensed "Effect Package" devices: unlocked by the card with **your own** SCOPE licence key file (`sudo pulsar-import-dsp --license YOURSERIAL.v5`) | **working**: 107 devices with a licence |
+| Factory presets (`.pre`): preset menu in the device panel, `pulsarctl load_preset` | **working** |
+| PC MIDI in (ALSA sequencer client "Pulsar2 MIDI") + test synth | first version |
+| Factory synths (voice arrays), ADAT/S/PDIF/MIDI ports | to do |
 
 ## Architecture
 
@@ -65,7 +69,7 @@ Alternatively, point the `PULSAR_DSP_DIR` variable to its `App/Dsp` folder.
 
 Download `snd-pulsar_<version>_all.deb` from the [Releases](https://github.com/faghy/SONIC_CORE_SCOPE_PCI_x64-Linux-driver/releases) page, then:
 ```bash
-sudo apt install ./snd-pulsar_0.3.0_all.deb                          # driver (DKMS), service, tools, Pulsar Scope
+sudo apt install ./snd-pulsar_0.5.0_all.deb                          # driver (DKMS), service, tools, Pulsar Scope
 sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe      # once: Sonic Core DSP files and devices
 ```
 Reboot (or reload the module): the card starts by itself. Remove with `sudo apt remove snd-pulsar`

@@ -1,7 +1,7 @@
 # Makefile for Creamware / Sonic Core Pulsar 2 Linux ALSA Driver
 
 obj-m += snd-pulsar.o
-snd-pulsar-objs := pulsar_core.o pulsar_pcm.o pulsar_hwdep.o pulsar_dsp.o pulsar_mixer.o
+snd-pulsar-objs := pulsar_core.o pulsar_pcm.o pulsar_hwdep.o pulsar_dsp.o pulsar_mixer.o pulsar_delay.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)

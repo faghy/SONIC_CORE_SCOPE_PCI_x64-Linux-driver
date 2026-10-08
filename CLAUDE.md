@@ -212,5 +212,11 @@ sudo rmmod snd-pulsar
    (tools/pulsar_values.py). Frequency pads (unit 1) are scaled by 48000/fs, time pads (unit 2) by fs/48000.
    GUI: knobs (tools/pulsar_widgets.py, live, Shift = fine, double-click = default), DevicePanel, "SCOPE devices"
    library branch. Devices folder: /var/lib/snd-pulsar/devices (pulsar-import-dsp copies <installer>/app/Devices).
-5. **Next:** synths (MIDI routing + voice manager), PC-side delay atoms (all delays/reverbs), license unlock word,
-   .pre presets, ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), JACK/Ardour check, .deb package, then the SCOPE-like config app.
+4i. **deb 0.5.0 (2026-10-08): PC delays, MIDI, licence, presets.** Kernel pulsar_delay.c (DELAY_ALLOC/FREE/PARAM, host-RAM
+   rings, docs/pc_delay.md). MIDI: tools/pulsar_midi.py, ALSA seq client "Pulsar2 MIDI" -> SNC2MIDI on DSP2 (node pc_midi),
+   builtin:test_synth (docs/midi_synths.md). Licence (docs/presets_license.md, tools/pulsar_license.py): key file in
+   /var/lib/snd-pulsar/license/*.v5 (0600, `pulsar-import-dsp --license`), board sno from uC 0x229; modules with magicProt get
+   uC unlock ops (DSP5, cmd 0x220) before fnInit; devices() hides devices whose seg_id the licence does not cover (107 shown).
+   Presets: `presets`/`load_preset` commands, .pre in /var/lib/snd-pulsar/presets, GUI combo in DevicePanel.
+   Device survey uses multiprocessing "spawn" (fork deadlocked inside the threaded daemon). NEVER commit the user's .v5/serial.
+5. **Next:** factory synths (voice arrays from pc_midi), hardware test of delays/reverbs and licensed audio, ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), JACK/Ardour check, .deb package, then the SCOPE-like config app.

@@ -272,6 +272,8 @@ class ClockMixin:
     def finish_run(self, irq=False, rate=44100):
         sn = self.uc_query(0x229)                      # vt+0xf8
         inf = self.uc_query(0x21F)                     # vt+0x220
+        self.uc_serial = sn                            # board serial (licence check, pulsar_license)
+        self.uc_info = None if inf is None else (inf >> 16) & 0xFFFF
         print("  uC: serial=%s info=%s" % (
             "n/a" if sn is None else "0x%08x" % sn,
             "n/a" if inf is None else "0x%04x" % ((inf >> 16) & 0xFFFF)))

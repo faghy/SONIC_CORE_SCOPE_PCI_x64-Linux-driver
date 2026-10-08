@@ -136,9 +136,11 @@ At their place in the signal path, they control a gain or modulation input. Thei
 - Without the host's unlock word, the output stays 0. Example: Tremolo M's Volume Modulator depth input is fed
   by this atom, so the effect stays silent.
 
-How SCOPE derives the word is not analysed; it is probably tied to the user's license (extras 0x105
-`moduleKey`) [?]. `scope_device.py` flags these devices with `license_atoms` and a warning. The recommended
-devices contain none.
+The word is computed by the board's micro-controller from the owner's key file entry and the module's
+`seg_id`. This is decoded in **presets_license.md §L** and implemented in `tools/pulsar_license.py`.
+`scope_device.py` flags these devices with `license_atoms` and a warning. It matches the atom name only, so 19
+more devices with licensed modules (SC-EQ, SC-C, Vinco, ...) are not flagged (presets_license.md §L.6). The
+recommended devices contain none.
 
 ---------------------------------------------------------------------------------------------------
 ## 2. Pads and wiring
@@ -465,7 +467,7 @@ directly.
 - Host atoms: PC Master/256k delays (pc_delay*.cpp in Sim2k) and the Compensate Delay Linker. These are needed by
   every delay and reverb.
 - The voice manager (MIDI Voice Control, voice arrays, `VoiceDef`) for synths.
-- The license atom unlock word (§1.5).
+- The license atom unlock word (§1.5): done, see presets_license.md §L.
 - The placement value encoding (17/255).
 - The `.pre` record → pad mapping.
 - `DelayTimeCalcEx` and the logic scripts used by dynamics devices.

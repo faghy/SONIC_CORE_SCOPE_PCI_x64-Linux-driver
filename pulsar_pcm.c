@@ -44,12 +44,15 @@ static void table_layout(struct pulsar_card *chip)
 		maxslot = max_t(unsigned int, maxslot, r->play_slot[c]);
 	for (c = 0; c < r->cap_channels; c++)
 		maxslot = max_t(unsigned int, maxslot, r->cap_slot[c]);
+	maxslot = max(maxslot, pulsar_delay_max_slot(chip));	/* host delay lines, pulsar_delay.c */
 	end = maxslot + 1;
 	n = maxslot + 1 > PULSAR_SLOT_PC_FIRST + 2 ? maxslot + 1 - PULSAR_SLOT_PC_FIRST : 2;
 
 	for (s = PULSAR_SLOT_FIRST; s < end; s++)
 		slot_write(chip, s, PULSAR_SLOT_IDLE);
+	pulsar_delay_restore_entries(chip);		/* delay lines keep running */
 	slot_write(chip, end, 0);			/* terminator */
+	chip->slot_end = end;
 
 	w0 = readl(chip->iobase + PULSAR_SLOT_A(0));
 	w0 = (w0 & 0xc03fffff) | (n & 0x1f) << 25 | (n & 0xe0) << 17;

@@ -29,6 +29,7 @@ import glob
 import os
 import re
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sc_decode  # noqa: E402
@@ -41,6 +42,7 @@ PM_START, PM_SIZE = 0x8000, 0x1800      # pluto vt+0xd8/+0xdc  -> PM heap 0x8000
 DM_START, DM_SIZE = 0xC400, 0x1C00      # pluto vt+0xe0/+0xe4  -> DM heap 0xC400..0xDFFF
 COMM_BASE = 0xC080                      # pluto vt+0xf8: sync-output (TCB) block of DSP d = COMM_BASE + 0x20*d
 TCB_SPAN = 0x20                         # words per DSP block before a neighbour block must be moved
+SYNCPC_LIMIT = 0xC300                    # PC window (SYNCPC_MEMBASE): end of the DSP comm area
 CODEBUF_LEN = 0x60                      # OS codeBuf: 96 DM words (max patch addresses per sysmsg 6)
 CLEARMEM_MIN = 0x20                     # UploadData uses sysmsg 0x11 for all-zero blocks longer than this
 
@@ -538,8 +540,10 @@ class PlutoDsp:
                     e.addr["seg_inda"] = self.dm.alloc_fixed(mod.inda_block, inda_sz)
 
     # ---- load = allocate + link + upload + activate (pluto vt+0x9c FUN_10c3b890, FUN_10c1b170)
-    def load(self, cls_or_path, name=None, after=None, allow_unresolved=False):
-        """Returns (module, ops). `after`: insert after this module in the chains (default: at the end)."""
+    def load(self, cls_or_path, name=None, after=None, allow_unresolved=False, unlock=None):
+        """Returns (module, ops). `after`: insert after this module in the chains (default: at the end).
+        `unlock(mod)` -> ops: licence unlock (pulsar_license.unlock_hook), run after the uploads and
+        before fnInit, like Sim2k FUN_10c1bea0 does after seg_mod."""
         cls = cls_or_path if isinstance(cls_or_path, ModuleClass) else ModuleClass(cls_or_path)
         mod = Module(cls, name)
         mod.dsp = self.dspno
@@ -586,6 +590,8 @@ class PlutoDsp:
         mod.loaded = True
         # 3. activation (FUN_10c1b170) - computed before the module is in the host list
         idx = len(self.modules) if after is None else self.modules.index(after) + 1
+        if unlock is not None:
+            ops += unlock(mod)
         ops = self._fix(ops) + self._activate(mod, idx)
         self.modules.insert(idx, mod)
         # 4. init/inda overlays are free again once fnInit has run
@@ -698,6 +704,10 @@ class PlutoDsp:
         return slot, ops
 
     def tcb_base_limit(self):
+        # The last DSP's block can grow into the unused comm area up to the PC window (0xC300) without
+        # moving a neighbour: room for the many capture slots of SCOPE reverbs (docs/pc_delay.md §6) [L].
+        if self.dspno == 5:
+            return SYNCPC_LIMIT
         return COMM_BASE + TCB_SPAN * (self.dspno + 1)
 
     # ---- inputs (FUN_10c1b8f0) [C]
@@ -831,6 +841,8 @@ def execute(board, ops, sysmsg_addr=None):
             board.set_value(dsp, op[2], op[3])
         elif kind == "sysmsg":
             _sysmsg(board, dsp, op[2], op[3], op[4])
+        elif kind == "sleep":
+            (board.sleep if hasattr(board, "sleep") else lambda ms: time.sleep(ms / 1000.0))(op[2])
         elif kind == "patch":
             _, _, addrs, value, _ = op
             board.upload_data(dsp, list(addrs), syms.get("codeBuf", 0xC41D))
@@ -856,6 +868,8 @@ def format_ops(ops):
             out.append("DSP%d SetValue   0x%04X = 0x%08X  %s" % (d, op[2], op[3] & 0xFFFFFFFF, op[4]))
         elif k == "sysmsg":
             out.append("DSP%d sysmsg %-3s a=0x%X b=0x%X  %s" % (d, "0x%x" % op[2], op[3], op[4] & 0xFFFFFFFF, op[5]))
+        elif k == "sleep":
+            out.append("      Sleep %d ms" % op[2])
         elif k == "patch":
             out.append("DSP%d patch %s := 0x%X  %s" % (d, ",".join("0x%04X" % a for a in op[2]), op[3], op[4]))
     return "\n".join(out)

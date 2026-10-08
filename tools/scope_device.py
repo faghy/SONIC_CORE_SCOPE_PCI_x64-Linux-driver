@@ -22,6 +22,7 @@ CLI:
   scope_device.py plan FILE.dev [--dsp DIR] [--json]
   scope_device.py survey DIR [--dsp DIR] [--jobs N] [--json OUT]
   scope_device.py raw FILE.dev PARAM VALUE [--rate 48000]
+  scope_device.py presets FILE.dev [N|NAME] [--pre FILE.pre] [--json]   presets / preset N as param values
 
 Spec and evidence: docs/device_format.md.  Python 3 standard library only; uses scope_dev.py (container and
 object parser), pulsar_modules.py (DSP module descriptors).
@@ -37,6 +38,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scope_dev as sd          # noqa: E402
 import pulsar_modules as pm     # noqa: E402
+import pulsar_delay as pdl      # noqa: E402  (host delay atoms, docs/pc_delay.md)
 
 DEFAULT_DSP_DIR = "/var/lib/snd-pulsar/dsp"
 INTMAX = 0x7FFFFFFF
@@ -602,7 +604,84 @@ def converter_steps(al, invar):
     if pep == "ScriptMultiplier" and invar in ("in1", "in2"):
         other = "in2" if invar == "in1" else "in1"
         return [("out", [{"op": "scale", "k": _num(_pval(vs[other]), 1.0) if other in vs else 1.0}])]
-    return None
+    return _pc_delay_converter_steps(al, invar)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# host delay atoms ("PC Master 4k/32k Delay", "PC 256k Delay", "PC Early Reflection"), docs/pc_delay.md
+# ---------------------------------------------------------------------------------------------------------
+
+def _pc_delay_converter_steps(al, invar):
+    """DelayTimeCalcEx.pep [C]: Tout = min(Tin, Dmax) in direct mode (DirT != 0); in tempo mode (DirT == 0)
+    Tout = int(6000/BPM * 192000 * num[Nidx]/384), driven by BPM/Nidx, not by the Tin knob.
+    Values are sample ticks at 48 kHz; the delay atom's Del pad (Unit 2) rescales them to fs."""
+    vs = al["vars"]
+    if al["pep"] != "DelayTimeCalcEx":
+        return None
+    if invar != "Tin":
+        return []                   # Tout/Tbpm are its outputs; DirT/BPM/Nidx/Dmax do not follow the knob
+    if int(_num(_pval(vs["DirT"]), 1)) == 0 if "DirT" in vs else False:
+        return []                   # tempo-sync mode: the time knob does not reach the delay
+    dmax = _num(_pval(vs["Dmax"]), 0) if "Dmax" in vs else 0
+    return [("Tout", [{"op": "clip", "lo": -2147483648.0, "hi": dmax if dmax > 0 else INTMAX}])]
+
+
+def _pc_delay_module(m, at):
+    """Mark plan module `m` as a host delay atom (instead of a blocker). True if it is one."""
+    spec = pdl.atom_spec(at["module"])
+    if spec is None:
+        return False
+    m["kind"] = "pc_delay"
+    m["pc_delay"] = spec
+    m["cycles"] = 0
+    if len(at["ins"]) < 2 or not at["outs"]:
+        return False
+    return True
+
+
+def _pc_delay_annotate(res, dv):
+    """Per host delay atom: the source of its signal input, the taps in use, and how each delay/gain pad is
+    fed (constant, parameter, or a DSP async output = 'host_async' wire, e.g. DLEXTM1 'DT')."""
+    pcs = {m["key"]: m for m in res["modules"] if m.get("kind") == "pc_delay"}
+    res["pc_delays"] = []
+    if not pcs:
+        return
+    for key, m in pcs.items():
+        spec = m["pc_delay"]
+        ins = [w for w in res["wires"] if w["dst_key"] == key and w["in"] == 0]
+        taps = sorted({w["out"] for w in res["wires"] if w["src_key"] == key})
+        info = {"key": key, "type": spec["type"], "kind": spec["kind"], "input": None, "taps_used": taps,
+                "pads": {}}
+        if len(ins) != 1:
+            dv.unsupported.append("%s: delay input must be fed by exactly one DSP output" % key)
+        else:
+            src = ins[0]["src_key"]
+            sm = next((x for x in res["modules"] if x["key"] == src), None)
+            if sm is None or sm.get("kind") == "pc_delay":
+                dv.unsupported.append("%s: delay input fed by another host atom" % key)
+            info["input"] = [src, ins[0]["out"]]
+        if any(w["src_key"] == key and w["dst_key"] in pcs for w in res["wires"]):
+            dv.unsupported.append("%s: delay output wired to another host atom" % key)
+        for w in res["wires"]:
+            if w["dst_key"] != key or w["in"] == 0:
+                continue
+            role = pdl.pad_role(spec, w["in"])
+            sm = next((x for x in res["modules"] if x["key"] == w["src_key"]), None)
+            if role[0] != "delay" or spec["kind"] == pdl.KIND_ER or sm is None or sm.get("kind") == "pc_delay":
+                dv.unsupported.append("%s: pad %d %s cannot be driven by %s" % (key, w["in"], role, w["src_key"]))
+                continue
+            w["host_async"] = True              # DSP async out -> BAR dword -> kernel (PULSAR_DELAY_P_SOURCE)
+            info["pads"][w["in"]] = "dsp"
+        for c in res["consts"]:
+            if c["key"] == key:
+                info["pads"].setdefault(c["in"], "const")
+        for q in res["params"]:
+            for t in q["targets"]:
+                if t.get("key") == key and "in" in t:
+                    info["pads"][t["in"]] = "param"
+        res["pc_delays"].append(info)
+    if res["ports"] and any(k in pcs for p in res["ports"] for k, _ in (p.get("targets") or [])):
+        dv.unsupported.append("device port wired straight to a host delay atom")
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -634,7 +713,9 @@ def plan(dev_path, dsp_dir=DEFAULT_DSP_DIR, switch_values=None):
         fn = resolve_atom(at["module"], dsp_dir)
         m = {"key": key, "atom": at["module"], "dsp_file": fn, "fixed_dsp": None, "same_dsp_group": None,
              "cycles": None, "placement": None}
-        if fn is None:
+        if fn is None and _pc_delay_module(m, at):
+            pass
+        elif fn is None:
             dv.unsupported.append("no DSP file for atom %r (%s) - host/PC-side or other-board module"
                                   % (at["module"], key))
         else:
@@ -884,6 +965,7 @@ def plan(dev_path, dsp_dir=DEFAULT_DSP_DIR, switch_values=None):
         if names[q["name"]] > 1:
             q["name"] = "%s (%s)" % (q["name"], q["key"].rsplit("/", 2)[-2] if q["key"].count("/") > 1 else q["key"])
     res["dsp_cycles"] = sum(m["cycles"] or 0 for m in res["modules"])
+    _pc_delay_annotate(res, dv)
     res["complete"] = not dv.unsupported
     dv.unsupported[:] = sorted(set(dv.unsupported))
     res["order"] = _topo(res)
@@ -977,6 +1059,9 @@ def pulsard_requests(p, rate=48000, inputs=None, outputs=None):
     the 'load' requests: every request refers to modules as {"$": key}).  inputs / outputs map a device port
     name to an existing (node, out) source / list of (node, in) destinations, e.g.
     inputs={"In": ("n4", 0)}, outputs={"Out": [("n6", 0)]}."""
+    if p.get("pc_delays"):
+        raise ValueError("%s uses host delay lines (%d): build it with 'pulsarctl load_device', the step-by-step "
+                         "requests cannot allocate them (docs/pc_delay.md)" % (p["name"], len(p["pc_delays"])))
     reqs = []
     for key in p["order"]:
         m = next(x for x in p["modules"] if x["key"] == key)
@@ -1126,8 +1211,18 @@ def main():
     a3.add_argument("value", type=float)
     a3.add_argument("--dsp", default=DEFAULT_DSP_DIR)
     a3.add_argument("--rate", type=int, default=48000)
+    a5 = sub.add_parser("presets", help="list a device's presets, or show preset N mapped to its parameters")
+    a5.add_argument("file", help=".dev (presets of the device) or .pre (raw preset file)")
+    a5.add_argument("preset", nargs="?", help="preset index or name")
+    a5.add_argument("--pre", help="preset file (default: Presets/<Caption>.pre, see find_preset_file)")
+    a5.add_argument("--dev", help="with a .pre FILE: device that names the values")
+    a5.add_argument("--dsp", default=DEFAULT_DSP_DIR)
+    a5.add_argument("--rate", type=int, default=48000)
+    a5.add_argument("--json", action="store_true")
     a = ap.parse_args()
     sys.setrecursionlimit(20000)
+    if a.cmd == "presets":
+        return _presets_cli(a)
     if a.cmd == "plan":
         p = plan(a.file, a.dsp)
         if a.json:
@@ -1196,6 +1291,844 @@ def main():
     if a.json:
         with open(a.json, "w") as f:
             json.dump(rows, f, indent=1, default=_json_default)
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Polyphony: voice arrays and per-voice instances (docs/midi_synths.md §3)
+#
+# base.dll ROCAtom::LoadAtom @100bb3d0 / VoiceModuleIn @100532e0 / VoiceModuleOut @100533e0 /
+# RouteInput @10053580 / ChangeVoices @1008ade0 / ForceSingleVoice @1008b030, Sim2k SetVoices @10c06a00 ->
+# FUN_10c17de0.  Kept apart from plan(): voice_plan() post-processes a finished plan.
+# ---------------------------------------------------------------------------------------------------------
+
+VOICE_MARK = 0x2000             # pad type bit: first pad of a voice record [C]
+SINGLE_ATOM = 0x10000           # module flag: one instance for all voices (array pads + SetVoices) [C]
+ARRAY_PARAM_MASK = 0x00F00000   # input pad type bits of a PROCParam (table) input: 0x80/0x20/0x10 [L]
+FORCE_SINGLE_EXTRA = "0x108"    # ROCAtom extras chunk 0x108 -> ForceSingleVoice (ROCAtom::ReadExtraChunk) [C]
+
+
+def voice_layout(cls):
+    """Voice-array structure of a DSP module class, as base.dll LoadAtom derives it from the pad types.
+
+    A record starts at a pad with type bit 0x2000; the distance to the next marker is the record length.
+    Returns None for modules without arrays, else a dict:
+      n                internal voices (array length)
+      in_first/in_rec  first array input / inputs per voice (0 = no input array)
+      ao_first/ao_rec  same for async outputs, so_first/so_rec for sync outputs
+      atom_in/atom_ao/atom_so  pad counts the atom shows (first record only)
+    """
+    ins = [p for p in cls.pads if p.kind == "in"]
+    aos = [p for p in cls.pads if p.kind == "async_out"]
+    sos = [p for p in cls.pads if p.kind == "sync_out"]
+
+    def rec(pads):
+        marks = [i for i, p in enumerate(pads) if p.type & VOICE_MARK]
+        if len(marks) < 2:
+            return 0, 0, 0
+        first, ln = marks[0], marks[1] - marks[0]
+        n = (len(pads) - first) // ln
+        return first, ln, n
+
+    (inf, inr, inn), (aof, aor, aon), (sof, sor, son) = rec(ins), rec(aos), rec(sos)
+    ns = [x for x in (inn, aon, son) if x > 1]
+    if not ns:
+        return None
+    n = min(ns)
+    return {"n": n, "consistent": len(set(ns)) == 1,
+            "in_first": inf, "in_rec": inr, "ao_first": aof, "ao_rec": aor, "so_first": sof, "so_rec": sor,
+            "atom_in": len(ins) - (n - 1) * inr, "atom_ao": len(aos) - (n - 1) * aor,
+            "atom_so": len(sos) - (n - 1) * sor, "num_ao": len(aos)}
+
+
+def _vmap(i, first, ln, n, v):
+    """Atom pad index -> module pad index for voice v (globals before and after the array keep their place)."""
+    if not ln or i < first:
+        return i
+    if i < first + ln:
+        return i + v * ln
+    return i + (n - 1) * ln
+
+
+def voice_in_pad(lay, i, v):
+    """Module input pad of atom input i for voice v."""
+    return i if lay is None else _vmap(i, lay["in_first"], lay["in_rec"], lay["n"], v)
+
+
+def voice_out_pad(lay, k, v):
+    """Module output pad (async outs first, then sync) of atom output k for voice v."""
+    if lay is None:
+        return k
+    if k < lay["atom_ao"]:
+        return _vmap(k, lay["ao_first"], lay["ao_rec"], lay["n"], v)
+    j = k - lay["atom_ao"]
+    return lay["num_ao"] + _vmap(j, lay["so_first"], lay["so_rec"], lay["n"], v)
+
+
+def _is_array_in(lay, i):
+    return lay is not None and lay["in_rec"] and lay["in_first"] <= i < lay["in_first"] + lay["in_rec"]
+
+
+def _is_array_out(lay, k):
+    if lay is None:
+        return False
+    if k < lay["atom_ao"]:
+        return bool(lay["ao_rec"]) and lay["ao_first"] <= k < lay["ao_first"] + lay["ao_rec"]
+    j = k - lay["atom_ao"]
+    return bool(lay["so_rec"]) and lay["so_first"] <= j < lay["so_first"] + lay["so_rec"]
+
+
+def voice_cycles(cycles, voices):
+    """seg_desc cycle words of voice-array modules: low 16 bits fixed + high 16 bits per voice [L]
+    (16MIX 0x20008, M_V_M16E 0xa0013)."""
+    if cycles is None:
+        return None
+    return (cycles & 0xFFFF) + (cycles >> 16) * max(1, voices)
+
+
+def protected_atoms(p, dsp_dir=DEFAULT_DSP_DIR):
+    """Plan modules whose DSP file carries the copy-protection pattern (symbol 'magicProt': seg_init only
+    enables the real code when the host wrote the right word).  More general than the 'Package' name test:
+    every factory synth has exactly one of these (EDS 16i, Poison FM, Synthesizer Package I/II, ...)."""
+    out = []
+    for m in p["modules"]:
+        c = module_class(dsp_dir, m["dsp_file"]) if m.get("dsp_file") else None
+        if c is None or isinstance(c, Exception):
+            continue
+        if any(s.name == "magicProt" for s in c.obj.symbols):
+            out.append(m["key"])
+    return out
+
+
+def _input_default_symbols(cls):
+    """input index -> symbol the module's own seg_mod relocation points the input word at (e.g. VelTab,
+    def_E_Sync); 'inputN' / '_null' mean 'no own default'."""
+    res = {}
+    sec = next((s for s in cls.obj.sections if s.name.startswith("seg_mod")), None)
+    if sec is None:
+        return res
+    for (vaddr, symndx, rtype) in sec.relocs:
+        off = vaddr - sec.vaddr
+        i = off - cls.off_input(0)
+        if 0 <= i < cls.numIn:
+            name = cls.obj.symbyidx[symndx].name
+            if not re.fullmatch(r"input\d+|_null", name):
+                res[i] = name
+    return res
+
+
+def voice_plan(dev_path, voices=4, dsp_dir=DEFAULT_DSP_DIR, scope_exact=False, base=None):
+    """Plan of a polyphonic device with the voices expanded for pulsard / pulsar_modules.
+
+    * Voice-array atoms (module flag 0x10000 or extras 0x108 = single instance, with 0x2000 pad records, e.g.
+      MIDI Voice Control, Mixer 16) stay ONE module; their atom pads are mapped to the module pads of each
+      voice (wires/consts/ports then use real module pad numbers) and the module gets SetVoices(n)
+      (entry in "set_voices").
+    * Poly-capable atoms (flag 0x10000 clear, no 0x108) that depend on a voice (fed, directly or through other
+      such atoms, by an array output) are instantiated once per voice: key, key#v1, key#v2 ...
+      SCOPE instantiates every poly-capable atom n times and connects only voice 0 into mono inputs; the extra
+      copies of atoms that see only mono signals compute the same thing, so they are skipped unless
+      scope_exact=True.
+    * PROCParam table inputs (Tune/Velocity/Aftertouch tables, MIDI FIFOs) are listed in "tables" with the
+      element count and the values stored in the device; "keep_default" tells that the module has its own table
+      (seg_mod relocation of the input word) and the stored values are all zero.
+
+    voices is clamped to the smallest array of the device.  The result has the plan() layout plus
+    "voices", "set_voices" [{key, voices}], "tables" [{key, in, pad, elements, values, keep_default}] and
+    per module "voice" / "voice_of" (copies) or "voice_layout" (array modules)."""
+    p = base if base is not None else plan(dev_path, dsp_dir)
+    dv = Device(dev_path, dsp_dir)
+    mods = {m["key"]: m for m in p["modules"]}
+    kind, lay, cls_of = {}, {}, {}
+    unsupported = [u for u in p["unsupported"]]
+    for key, m in mods.items():
+        c = module_class(dsp_dir, m["dsp_file"]) if m.get("dsp_file") else None
+        if c is None or isinstance(c, Exception):
+            kind[key] = "single"
+            continue
+        cls_of[key] = c
+        at = dv.atoms.get(key)
+        a = at["obj"].f.get("algo") if at else None
+        forced = any(str(x.get("key", "")).startswith(FORCE_SINGLE_EXTRA)
+                     for x in ((a.f.get("extras") or []) if a is not None else []))
+        L = voice_layout(c)
+        lay[key] = L
+        if L is not None:
+            if not (c.flags & SINGLE_ATOM or forced):
+                unsupported.append("%s: poly module %s with internal voices (VoiceDef groups) not handled"
+                                   % (key, m["dsp_file"]))
+            kind[key] = "array"
+            if at is not None and (len(at["ins"]) != L["atom_in"] or
+                                   len(at["outs"]) != L["atom_ao"] + L["atom_so"]):
+                continue                     # leave the 'pad count differs' blocker in place
+            unsupported = [u for u in unsupported if not (u.startswith(key + ": pad count differs") or
+                                                          u == "polyphonic DSP module %s (%s)" % (m["dsp_file"], key))]
+            if not L["consistent"]:
+                p["warnings"].append("%s: input/output voice counts differ in %s" % (key, m["dsp_file"]))
+        elif c.flags & SINGLE_ATOM or forced:
+            kind[key] = "single"
+        else:
+            kind[key] = "poly"
+    unsupported = [u for u in unsupported if not u.startswith("polyphonic: ")]
+    arrays = [k for k, v in kind.items() if v == "array"]
+    n = max(1, min([voices] + [lay[k]["n"] for k in arrays]))
+
+    # voice-dependent poly atoms (fixpoint over the wires)
+    vd = set(k for k, v in kind.items() if v == "poly") if scope_exact else set()
+    changed = not scope_exact
+    while changed:
+        changed = False
+        for w in p["wires"]:
+            s, d = w["src_key"], w["dst_key"]
+            if kind.get(d) != "poly" or d in vd:
+                continue
+            if s in vd or (kind.get(s) == "array" and _is_array_out(lay[s], w["out"])):
+                vd.add(d)
+                changed = True
+
+    def copies(key):
+        return [key] + ["%s#v%d" % (key, v) for v in range(1, n)] if key in vd else [key]
+
+    def dst_list(key, i):
+        """[(instance key, module in pad, voice)] that atom input (key, i) stands for."""
+        if key in vd:
+            return [(k, i, v) for v, k in enumerate(copies(key))]
+        L = lay.get(key)
+        if kind.get(key) == "array" and _is_array_in(L, i):
+            return [(key, voice_in_pad(L, i, v), v) for v in range(n)]
+        return [(key, voice_in_pad(L, i, 0), 0)]
+
+    def src_for(key, k, v):
+        """(instance key, module out pad) feeding voice v from atom output (key, k)."""
+        if key in vd:
+            return copies(key)[v], k
+        L = lay.get(key)
+        if kind.get(key) == "array":
+            return key, voice_out_pad(L, k, v if _is_array_out(L, k) else 0)
+        return key, k
+
+    res = dict(p)
+    res["voices"] = n
+    res["modules"] = []
+    for m in p["modules"]:
+        key = m["key"]
+        if key in vd:
+            for v, k in enumerate(copies(key)):
+                res["modules"].append(dict(m, key=k, voice=v, voice_of=key))
+        elif kind.get(key) == "array":
+            c = cls_of[key]
+            res["modules"].append(dict(m, voice_layout=lay[key], voices=n,
+                                       cycles=voice_cycles(c.syncCycles, n)))
+        else:
+            res["modules"].append(dict(m))
+    res["wires"] = []
+    for w in p["wires"]:
+        for dk, di, v in dst_list(w["dst_key"], w["in"]):
+            sk, so = src_for(w["src_key"], w["out"], v)     # mono destination: v = 0 (RouteInput)
+            res["wires"].append({"src_key": sk, "out": so, "dst_key": dk, "in": di})
+    res["consts"] = []
+    for cst in p["consts"]:
+        for dk, di, v in dst_list(cst["key"], cst["in"]):
+            res["consts"].append(dict(cst, key=dk, **{"in": di}))
+    res["params"] = []
+    for q in p["params"]:
+        q2 = dict(q)
+        tg = []
+        for t in q.get("targets", []):
+            if t.get("kind") == "switch" or "in" not in t:
+                tg.append(t)
+                continue
+            for dk, di, v in dst_list(t["key"], t["in"]):
+                tg.append(dict(t, key=dk, **{"in": di}))
+        q2["targets"] = tg
+        res["params"].append(q2)
+    res["ports"] = []
+    for port in p["ports"]:
+        q = dict(port)
+        if port["dir"] == "in":
+            q["targets"] = [[dk, di] for k, i in port["targets"] for dk, di, _ in dst_list(k, i)]
+        else:
+            q["targets"] = [list(src_for(k, o, 0)) for k, o in port["targets"]]
+        q["target"] = q["targets"][0] if q["targets"] else None
+        res["ports"].append(q)
+    res["set_voices"] = [{"key": k, "voices": n} for k in arrays]
+    # PROCParam tables
+    tables = []
+    for key, at in dv.atoms.items():
+        c = cls_of.get(key)
+        if c is None or key not in mods:
+            continue
+        defaults = _input_default_symbols(c)
+        for i, v in enumerate(at["ins"]):
+            mp = voice_in_pad(lay.get(key), i, 0)
+            if mp >= c.numIn or not (c.pads[mp].type & ARRAY_PARAM_MASK):
+                continue
+            par = v.f.get("param") or {}
+            items = [it.get("value", 0) for it in (par.get("items") or [])]
+            elements = int(_num((par.get("attrs") or {}).get("DataElements"), len(items) or 0))
+            vals = [int(_num(x)) for x in items]
+            for k2 in copies(key) if key in vd else [key]:
+                tables.append({"key": k2, "in": mp, "pad": _vname(v), "elements": elements, "values": vals,
+                               "default_symbol": defaults.get(mp),
+                               "keep_default": bool(defaults.get(mp)) and not any(vals)})
+    res["tables"] = tables
+    lic = protected_atoms(res, dsp_dir)
+    res["protected_atoms"] = sorted({m["voice_of"] if "voice_of" in m else m["key"]
+                                     for m in res["modules"] if m["key"] in lic})
+    res["unsupported"] = sorted(set(unsupported))
+    res["dsp_cycles"] = sum(m["cycles"] or 0 for m in res["modules"])
+    res["complete"] = not res["unsupported"]
+    res["order"] = _topo(res)
+    return res
+
+
+def print_voice_plan(p, out=sys.stdout):
+    out.write("%s: %d voices, %d modules, %d wires, %d cycles%s\n" % (
+        p["name"], p["voices"], len(p["modules"]), len(p["wires"]), p["dsp_cycles"],
+        "" if p["complete"] else "  INCOMPLETE"))
+    for m in p["modules"]:
+        extra = ""
+        if "voice_layout" in m:
+            L = m["voice_layout"]
+            extra = "ARRAY n=%d (in %d+%d*v, async out %d+%d*v, sync out %d+%d*v)" % (
+                L["n"], L["in_first"], L["in_rec"], L["ao_first"], L["ao_rec"], L["so_first"], L["so_rec"])
+        elif "voice" in m:
+            extra = "voice %d" % m["voice"]
+        out.write("  MOD  %-60s %-14s %6s cyc  %s\n" % (m["key"], m["dsp_file"], m["cycles"], extra))
+    for s in p["set_voices"]:
+        out.write("  SETVOICES %s = %d\n" % (s["key"], s["voices"]))
+    for t in p["tables"]:
+        out.write("  TABLE %s in%d (%s): %d elements%s%s\n" % (
+            t["key"], t["in"], t["pad"], t["elements"], ", nonzero" if any(t["values"]) else ", zero",
+            " (module default %s kept)" % t["default_symbol"] if t["keep_default"] else ""))
+    for a in p["protected_atoms"]:
+        out.write("  PROTECTED %s (copy-protection atom: silent until unlocked by the host)\n" % a)
+    for u in p["unsupported"]:
+        out.write("  BLOCKER %s\n" % u)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# presets (.pre files and the preset list embedded in a .dev) - docs/presets_license.md
+# ---------------------------------------------------------------------------------------------------------
+#
+# File (.pre): container = plain gzip (format -2) or S3 (format -3), see scope_dev.unpack_container.
+#   u32 header version (1 or 2), "Creamware Scope technology preset file\0", u32 size, then `size` bytes read
+#   by a MemInterpreter (base.dll Presets::LoadFromExternalFile @100b85e0, header FUN_10025c80,
+#   Presets::Read @100b3860 -> Presets::Read2(MemInterpreter&) @100ab0d0).
+# MemInterpreter (cwWindows.dll) alignment, relative to the start of the block: LONG/DWORD 4 bytes,
+#   GetBlock 8 bytes (@1023b0f0), BYTE and NUL-terminated strings unaligned.
+# The device's own list is the same block in pad 'PLData' of its Controls@PresetList script.
+
+PRESET_MAGIC = b"Creamware Scope technology preset file\0"
+PRESET_INFO_TYPES = {1: "date", 2: "author", 3: "description", 4: "category", 5: "ask_synapse"}  # preset.ped
+
+
+class _PresetReader:
+    """cwWindows MemInterpreter read side."""
+
+    def __init__(self, data, base):
+        self.d, self.base, self.p = data, base, base
+
+    def _align(self, n):
+        r = (self.p - self.base) % n
+        if r:
+            self.p += n - r
+
+    def byte(self):
+        if self.p >= len(self.d):
+            raise sd.FormatError("preset data truncated")
+        v = self.d[self.p]
+        self.p += 1
+        return v
+
+    def long(self):
+        self._align(4)
+        if self.p + 4 > len(self.d):
+            raise sd.FormatError("preset data truncated")
+        v = struct.unpack_from("<i", self.d, self.p)[0]
+        self.p += 4
+        return v
+
+    def count(self, limit=100000):
+        n = self.long()
+        if n < 0 or n > limit:
+            raise sd.FormatError("bad preset count %d @0x%x" % (n, self.p - 4))
+        return n
+
+    def block(self, n):
+        self._align(8)
+        if n < 0 or self.p + n > len(self.d):
+            raise sd.FormatError("preset block out of range @0x%x" % self.p)
+        v = self.d[self.p:self.p + n]
+        self.p += n
+        return v
+
+    def string(self):
+        try:
+            e = self.d.index(b"\0", self.p)
+        except ValueError:
+            raise sd.FormatError("unterminated preset string @0x%x" % self.p)
+        v = self.d[self.p:e].decode("latin-1")
+        self.p = e + 1
+        return v
+
+    def rocparam(self):
+        """base.dll FUN_1007b280: LONG DataType, then (type 10 = array) LONG n + n params, else LONG size +
+        block.  Returns (type, python value)."""
+        t = self.long()
+        if t == 10:
+            return t, [self.rocparam() for _ in range(self.count())]
+        n = self.count(0x1000000)
+        b = self.block(n) if n > 0 else b""
+        if t == 1 and n == 4:
+            return t, struct.unpack("<i", b)[0]
+        if t == 2 and n == 4:
+            return t, struct.unpack("<f", b)[0]
+        if t == 3 and n == 8:
+            return t, struct.unpack("<d", b)[0]
+        if t == 5:
+            return t, b.split(b"\0")[0].decode("latin-1")
+        return t, b.hex()
+
+    def info_user(self):
+        """PresetInfoUser::Read2Mem @1009e9f0: name, LONG number, LONG n, n x PresetInfo::Read2 @1007d0f0
+        (name, ROCParam, LONG type)."""
+        name, number = self.string(), self.long()
+        infos = {}
+        for _ in range(self.count()):
+            iname = self.string()
+            _t, v = self.rocparam()
+            itype = self.long()
+            infos[PRESET_INFO_TYPES.get(itype, iname or str(itype))] = v
+        return name, number, infos
+
+    def ref_preset(self):
+        """ReferencePreset (FUN_100740a0): values for a child device loaded at run time."""
+        name = self.string()
+        path = [self.long() & 0xFFFFFFFF for _ in range(self.count())]
+        vals = []
+        for _ in range(self.count()):
+            uid = self.block(16).hex()
+            pcid = self.long() & 0xFFFFFFFF
+            v = self.rocparam() if self.byte() else None
+            vals.append({"uid": uid, "pcid": pcid, "type": v and v[0], "value": v and v[1]})
+        subs = [self.ref_preset() for _ in range(self.count())]
+        return {"device": name, "pcid_path": path, "values": vals, "subs": subs}
+
+    def category(self):
+        """PresetCategory::Read2 @100aac10."""
+        name, number, infos = self.info_user()
+        idx = [self.long() for _ in range(self.count())]
+        subs = [self.category() for _ in range(self.count())]
+        return {"name": name, "number": number, "infos": infos, "presets": idx, "subs": subs}
+
+    def presets(self):
+        """Presets::Read2(MemInterpreter&) @100ab0d0."""
+        ver = self.long()
+        if ver >= 0 or ver < -3:
+            raise sd.FormatError("preset list format %d not supported" % ver)
+        if ver == -1:
+            raise sd.FormatError("old preset list format -1 (Preset::ReadOld @100b3390) not implemented")
+        if ver == -2:                       # two flag bytes (+2 DWORDs) and a DWORD, not used here
+            self.byte()
+            if self.byte():
+                self.long(), self.long()
+            self.long()
+        params = []
+        for _ in range(self.count()):       # UnresolvedPresetParameter: ParamUID (+ module PCID in -3)
+            uid = self.block(16).hex()
+            params.append({"uid": uid, "pcid": (self.long() & 0xFFFFFFFF) if ver == -3 else 0})
+        out = []
+        for _ in range(self.count()):
+            # -2: Preset::Read2 @100b35e0 (values: LONG ref, BYTE has, ROCParam)
+            # -3: Preset::Read2b @100aa6a0 (values: BYTE has, ROCParam, LONG ref)
+            name, number, infos = self.info_user()
+            vals = []
+            for _ in range(self.count()):
+                if ver == -2:
+                    ref = self.long()
+                    v = self.rocparam() if self.byte() else None
+                else:
+                    v = self.rocparam() if self.byte() else None
+                    ref = self.long()
+                vals.append((ref, v))
+            cats = [self.long() for _ in range(self.count())]
+            if ver == -2:
+                refs = [self.presets() for _ in range(self.count())]
+            else:
+                refs = [self.ref_preset() for _ in range(self.count())]
+            out.append({"name": name, "number": number, "infos": infos, "values": vals, "categories": cats,
+                        "refs": refs})
+        root = self.category()
+        return {"format": ver, "params": params, "presets": out, "root": root}
+
+
+def read_preset_block(data, base=0):
+    """Decode one Presets block (the payload of a .pre file or of a PLData pad)."""
+    return _PresetReader(data, base).presets()
+
+
+def read_pre_file(path):
+    """Decode a .pre file: {'format', 'params': [{uid, pcid}], 'presets': [...], 'root': category tree}."""
+    with open(path, "rb") as f:
+        plain, _ = sd.unpack_container(f.read())
+    if len(plain) < 8 + len(PRESET_MAGIC) or plain[4:4 + len(PRESET_MAGIC)] != PRESET_MAGIC:
+        raise sd.FormatError("%s: not a SCOPE preset file" % path)
+    hv = struct.unpack_from("<I", plain, 0)[0]
+    if hv < 1 or hv > 2:
+        raise sd.FormatError("%s: preset header version %d" % (path, hv))
+    p = 4 + len(PRESET_MAGIC)
+    size = struct.unpack_from("<I", plain, p)[0]
+    rd = _PresetReader(plain[:p + 4 + size], p + 4)
+    res = rd.presets()
+    if rd.p != p + 4 + size:
+        raise sd.FormatError("%s: %d bytes left after the preset list" % (path, p + 4 + size - rd.p))
+    return res
+
+
+def _category_paths(root):
+    """preset index -> category path ('Factory Presets/Pads' ...)."""
+    out = {}
+
+    def walk(c, path):
+        here = path + [c["name"]] if c["name"] and (not path or path[-1] != c["name"]) else path
+        for i in c["presets"]:
+            out.setdefault(i, "/".join(here))
+        for s in c["subs"]:
+            walk(s, here)
+    walk(root, [])
+    return out
+
+
+class _RawParser(sd.Parser):
+    """scope_dev.Parser that keeps the raw bytes of every ROCParam (needed for PLData)."""
+
+    def rocparam(self):
+        start = self.r.p
+        p = super().rocparam()
+        size = struct.unpack_from("<i", self.d, start)[0]
+        p["_raw"] = self.d[start + 4:start + 4 + size]
+        return p
+
+
+_PDEV = {}
+
+
+def device_parameters(dev_path):
+    """ROCParameter objects of a .dev (extras chunk 0x110 of the modules: u32 count + objects, parsed by
+    scope_dev.p_rocparameter = ROCParameter::Serialize @100858d0).  {uid hex: {name, id, target}}; target
+    is the pad id the parameter drives (ROCAtomPad, ROCPad or RODPad)."""
+    if dev_path in _PDEV:
+        return _PDEV[dev_path]
+    plain, _ = sd.load(dev_path)
+    out = {}
+    for m in re.finditer(rb"\x10\x01\x00\x00(....)(....)(?=\x0cROCParameter)", plain, re.S):
+        ln, n = struct.unpack("<II", m.group(1) + m.group(2))
+        ps = sd.Parser(plain)
+        ps.r.p = m.end()
+        try:
+            for _ in range(n):
+                o = ps.obj(ps.classname())
+                uid = o.f.get("raw16")
+                if uid and o.cls == "ROCParameter":
+                    out[uid] = {"name": o.f.get("name"), "id": o.f.get("id"), "target": o.f.get("target")}
+        except sd.FormatError:
+            continue
+    _PDEV.clear()
+    _PDEV[dev_path] = out
+    return out
+
+
+def embedded_presets(dev_path):
+    """The preset lists stored in the .dev itself: pad 'PLData' of every Controls@PresetList script.
+    [(script key, decoded block)]."""
+    dv = Device(dev_path, None)
+    plain, _ = sd.load(dev_path)
+    out = []
+    for key, al in dv.algos.items():
+        if al["pep"] != "Controls@PresetList" or "PLData" not in al["vars"]:
+            continue
+        ps = _RawParser(plain)
+        ps.r.p = al["vars"]["PLData"].off
+        try:
+            raw = ps.obj(al["vars"]["PLData"].cls).f["param"].get("_raw") or b""
+        except sd.FormatError:
+            continue
+        if len(raw) >= 8:
+            try:
+                out.append((key, read_preset_block(raw)))
+            except sd.FormatError:
+                pass
+    return out
+
+
+def preset_caption(dev_path):
+    """Name SCOPE uses for the default preset file: Caption pad of the root Controls@PresetList (PresetList.pep:
+    <StaticPath Presets>/<Caption>.pre), else the device name."""
+    dv = Device(dev_path, None)
+    best = None
+    for key, al in dv.algos.items():
+        if al["pep"] == "Controls@PresetList" and "Caption" in al["vars"]:
+            c = _sval(al["vars"]["Caption"])
+            if c and (best is None or key.count("/") < best[0]):
+                best = (key.count("/"), c)
+    return best[1] if best else dv.root.f.get("name")
+
+
+PRESET_DIRS = ["/var/lib/snd-pulsar/presets"]
+
+
+def find_preset_file(dev_path, extra_dirs=None):
+    """Default .pre of a device: a 'Presets' folder next to (or above) the devices folder, or PRESET_DIRS."""
+    name = preset_caption(dev_path) + ".pre"
+    dirs = list(extra_dirs or []) + PRESET_DIRS
+    d = os.path.dirname(os.path.abspath(dev_path))
+    for _ in range(8):
+        dirs.append(os.path.join(d, "Presets"))
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    for d in dirs:
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+        try:                                    # case-insensitive match (files copied from Windows)
+            for f in os.listdir(d):
+                if f.lower() == name.lower():
+                    return os.path.join(d, f)
+        except OSError:
+            pass
+    return None
+
+
+def _list_presets(block, source, names=None):
+    names = names or {}
+    cats = _category_paths(block["root"])
+    out = []
+    for i, p in enumerate(block["presets"]):
+        vals, uids = {}, {}
+        for ref, v in p["values"]:
+            if v is None or not 0 <= ref < len(block["params"]):
+                continue
+            uid = block["params"][ref]["uid"]
+            uids[uid] = v[1]
+            n = names.get(uid, {}).get("name") or uid
+            k, j = n, 2
+            while k in vals:                    # two parameters with the same name (PosX of two panels)
+                k, j = "%s#%d" % (n, j), j + 1
+            vals[k] = v[1]
+        e = {"index": i, "name": p["name"], "source": source, "category": cats.get(i, ""), "values": vals,
+             "uids": uids}
+        if p["number"] >= 0:
+            e["number"] = p["number"]
+        info = {k: v for k, v in p["infos"].items() if v not in ("", None)}
+        if info:
+            e["info"] = info
+        if p["refs"]:
+            e["sub_presets"] = len(p["refs"])
+        out.append(e)
+    return out
+
+
+def presets(path, dev_path=None, pre_path=None):
+    """Presets of a device or of a .pre file: [{index, name, source, category, values: {param name: raw pad
+    value}, ...}].  With a .dev: the default preset file (find_preset_file, or `pre_path`) first, then the
+    presets stored in the device.  Values are named by the device's ROCParameter names (raw 16-byte uid if no
+    device is known)."""
+    if path.lower().endswith(".pre"):
+        names = device_parameters(dev_path) if dev_path else {}
+        return _list_presets(read_pre_file(path), os.path.basename(path), names)
+    dev_path = path
+    names = device_parameters(dev_path)
+    out = []
+    pre = pre_path or find_preset_file(dev_path)
+    if pre:
+        out += _list_presets(read_pre_file(pre), os.path.basename(pre), names)
+    for key, blk in embedded_presets(dev_path):
+        out += _list_presets(blk, "device", names)
+    for i, e in enumerate(out):
+        e["index"] = i
+    return out
+
+
+def _inverse_chain(chain, v):
+    for st in reversed(chain):
+        op = st["op"]
+        if op == "linear":
+            (a0, a1), (b0, b1) = st["a"], st["b"]
+            if b1 == b0:
+                return None
+            v = a0 + (a1 - a0) * (v - b0) / float(b1 - b0)
+        elif op == "scale":
+            if not st["k"]:
+                return None
+            v = v / st["k"]
+        elif op == "add":
+            v = v - st["k"]
+        elif op == "one_minus":
+            v = 1.0 - v
+    return v
+
+
+def _param_nets(dv, p):
+    """net root -> host converter chain from the param's Val (the same walk as plan())."""
+    al = dv.algos.get(p["key"])
+    vv = al and al["vars"].get("Val")
+    if vv is None or not vv.f.get("id"):
+        return {}
+    out = {}
+    todo = [(dv.uf.find(vv.f["id"]), [])]
+    while todo and len(out) < 60:
+        r, chain = todo.pop()
+        if r in out:
+            continue
+        out[r] = chain
+        n = dv.nets.get(r)
+        if n is None or n["dsp_out"]:
+            continue
+        for hk, hv, pid in n["host"]:
+            h = dv.algos[hk]
+            if hk == p["key"] or h["pep"] in KNOB_PEPS or h["pep"] in TEXT_PEPS or h["pep"] in GUI_PEPS:
+                continue
+            cs = converter_steps(h, hv)
+            for outvar, steps in (cs or []):
+                ov = h["vars"].get(outvar)
+                if ov is not None and ov.f.get("id") and not any(s is None for s in steps):
+                    todo.append((dv.uf.find(ov.f["id"]), chain + steps))
+    return out
+
+
+def _class_in_pad(dv, key, i, dsp_dir):
+    try:
+        c = module_class(dsp_dir, resolve_atom(dv.atoms[key]["module"], dsp_dir))
+        cin = [p for p in c.pads if p.kind == "in"]
+        return cin[i] if i < len(cin) else None
+    except Exception:           # no DSP file: encoding from the pad type only
+        return None
+
+
+_PCTX = {}
+
+
+def preset_values(dev_path, preset, pre_path=None, rate=48000, dsp_dir=DEFAULT_DSP_DIR, the_plan=None):
+    """Values of preset `preset` (index into presets(dev_path, pre_path=...) or its name) for the device's
+    plan: {'name', 'params': {plan param name: display value}, 'vals': {plan param name: knob Val},
+    'raw': [{name, key, in, pad, value, word}] for DSP pads no plan param drives, 'host': [names of host-only
+    values (GUI state, unemulated scripts)], 'check': [...problems...]}.
+    Apply with pulsard set_param (params) and set (raw words)."""
+    ck = (os.path.abspath(dev_path), pre_path, dsp_dir)
+    ctx = _PCTX.get(ck)
+    if ctx is None:
+        p = the_plan or plan(dev_path, dsp_dir)
+        dv = Device(dev_path, dsp_dir)
+        net_param = {}                      # net root -> [(plan param, host converter chain from its Val)]
+        for q in p["params"]:
+            for r, chain in _param_nets(dv, q).items():
+                net_param.setdefault(r, []).append((q, chain))
+        rp = device_parameters(dev_path)
+        ctx = (presets(dev_path, pre_path=pre_path), rp, dv, net_param)
+        _PCTX.clear()
+        _PCTX[ck] = ctx
+    lst, rp, dv, net_param = ctx
+    if isinstance(preset, int) or (isinstance(preset, str) and preset.isdigit()):
+        sel = lst[int(preset)]
+    else:
+        m = [e for e in lst if e["name"] == preset] or [e for e in lst if e["name"].lower() == str(preset).lower()]
+        if not m:
+            raise KeyError("no preset %r" % preset)
+        sel = m[0]
+    res = {"name": sel["name"], "index": sel["index"], "source": sel["source"], "params": {}, "vals": {},
+           "raw": [], "host": [], "check": []}
+    for uid, value in sel["uids"].items():
+        pname = rp[uid]["name"] if uid in rp else uid
+        tgt = rp[uid]["target"] if uid in rp else None
+        if not tgt or len(tgt) != 1 or not isinstance(value, (int, float)):
+            res["host"].append(pname)
+            continue
+        pid = tgt[0]
+        hits = []
+        own = dv.pad_owner.get(pid)
+        for q, chain in net_param.get(dv.uf.find(pid), []):
+            val = _inverse_chain(chain, value)
+            if val is None:
+                continue
+            val = int(round(val))
+            # the parameter's own knob first, then a knob whose Val range holds the value (several buttons
+            # can share one Switch net)
+            hits.append((own is not None and own[1] == q["key"], q["val_min"] <= val <= q["val_max"], -len(chain),
+                         len(hits), q, val))
+        if hits:
+            *_, q, val = max(hits)
+            if not q["val_min"] <= val <= q["val_max"]:
+                res["check"].append("%s -> %s: Val %d outside %d..%d" % (pname, q["name"], val, q["val_min"],
+                                                                      q["val_max"]))
+                val = min(max(val, q["val_min"]), q["val_max"])
+            res["vals"][q["name"]] = val
+            try:
+                res["params"][q["name"]] = val_to_display(q, val)
+            except (ValueError, ZeroDivisionError):
+                res["params"][q["name"]] = float(val)
+            continue
+        n = dv.net_of(pid)
+        if n and n["dsp_in"] and not n["dsp_out"]:
+            for key, i, padid in n["dsp_in"]:
+                v = dv.pads[padid]
+                unit = _unit_of(v, None)
+                enc = _encoding(_class_in_pad(dv, key, i, dsp_dir), v, unit)
+                res["raw"].append({"name": pname, "key": key, "in": i, "pad": _vname(v), "value": value,
+                                   "unit": unit, "word": pad_encode(value, enc, unit, rate)})
+        else:
+            res["host"].append(pname)
+    return res
+
+
+def _presets_cli(a):
+    """scope_device.py presets FILE [--pre FILE.pre] [--dev FILE.dev] [--json] [N|NAME]"""
+    if a.file.lower().endswith(".pre"):
+        lst = presets(a.file, dev_path=a.dev)
+        if a.preset is not None:
+            lst = [e for e in lst if str(e["index"]) == a.preset or e["name"] == a.preset]
+        for e in lst:
+            e.pop("uids", None)
+        if a.json:
+            json.dump(lst, sys.stdout, indent=1, default=_json_default)
+            print()
+        else:
+            for e in lst:
+                print("%4d  %-32s %-28s %s" % (e["index"], e["name"], e["category"], ", ".join(
+                    "%s=%s" % kv for kv in e["values"].items())))
+        return 0
+    if a.preset is None:
+        lst = presets(a.file, pre_path=a.pre)
+        for e in lst:
+            e.pop("uids", None)
+        if a.json:
+            json.dump(lst, sys.stdout, indent=1, default=_json_default)
+            print()
+        else:
+            if not lst:
+                print("no presets (looked for %s.pre in %s and the device's PLData)" % (
+                    preset_caption(a.file), ", ".join(PRESET_DIRS + ["Presets/ folders above the .dev"])))
+            for e in lst:
+                print("%4d  %-32s %-12s %s" % (e["index"], e["name"], e["source"], e["category"]))
+        return 0
+    r = preset_values(a.file, int(a.preset) if a.preset.isdigit() else a.preset, a.pre, a.rate, a.dsp)
+    if a.json:
+        json.dump(r, sys.stdout, indent=1, default=_json_default)
+        print()
+        return 0
+    p = plan(a.file, a.dsp)
+    fmt = {q["name"]: q.get("display_format") for q in p["params"]}
+    print("preset %d %r (%s)" % (r["index"], r["name"], r["source"]))
+    for k, v in r["params"].items():
+        print("  PARAM %-40s %s" % (k, c_format(fmt.get(k), v) if fmt.get(k) else "%g" % v))
+    for x in r["raw"]:
+        print("  RAW   %-40s %s in%d (%s) = 0x%08x" % (x["name"], x["key"], x["in"], x["pad"], x["word"]))
+    if r["host"]:
+        print("  HOST  " + ", ".join(r["host"]))
+    for c in r["check"]:
+        print("  CHECK " + c)
     return 0
 
 

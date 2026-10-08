@@ -25,7 +25,11 @@ Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `
 | Pacchetto `.deb` (driver DKMS, servizio, strumenti, app) | **funziona** |
 | Dispositivi SCOPE (`.dev`): 36 effetti (EQ, filtri, dinamica, distorsione, phaser, flanger, chorus…) come un unico blocco con manopole in unità reali | **funziona** |
 | Manopole in stile SCOPE (Hz, dB…) per dispositivi e moduli comuni, codifica corretta degli ingressi float/interi | **funziona** |
-| Sintetizzatori (MIDI, gestione voci), delay/riverberi (moduli lato PC), dispositivi "Effect Package" con licenza, ADAT/S/PDIF/MIDI | da fare |
+| Delay e riverberi (linee di ritardo nella RAM del PC, nuovi ioctl del kernel) | **funzionante** in simulazione, test sulla scheda in corso |
+| Dispositivi "Effect Package" con licenza: sbloccati dalla scheda con il **tuo** file di licenza SCOPE (`sudo pulsar-import-dsp --license TUOSERIALE.v5`) | **funzionante**: 107 dispositivi con licenza |
+| Preset di fabbrica (`.pre`): menu dei preset nel pannello del dispositivo, `pulsarctl load_preset` | **funzionante** |
+| MIDI dal PC (client ALSA sequencer "Pulsar2 MIDI") + synth di prova | prima versione |
+| Synth di fabbrica (array di voci), porte ADAT/S/PDIF/MIDI | da fare |
 
 ## Architettura
 
@@ -62,7 +66,7 @@ In alternativa puoi indicare la cartella `App/Dsp` con la variabile `PULSAR_DSP_
 
 Scarica `snd-pulsar_<versione>_all.deb` dalla pagina [Releases](https://github.com/faghy/SONIC_CORE_SCOPE_PCI_x64-Linux-driver/releases), poi:
 ```bash
-sudo apt install ./snd-pulsar_0.3.0_all.deb                          # driver (DKMS), servizio, strumenti, Pulsar Scope
+sudo apt install ./snd-pulsar_0.5.0_all.deb                          # driver (DKMS), servizio, strumenti, Pulsar Scope
 sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe      # una volta: file DSP e dispositivi di Sonic Core
 ```
 Riavvia (o ricarica il modulo) e la scheda parte da sola. Si rimuove con `sudo apt remove snd-pulsar`

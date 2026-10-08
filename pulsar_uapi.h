@@ -72,4 +72,45 @@ struct pulsar_msg {
 #define PULSAR_IOCTL_SET_CONTROLS _IOW(PULSAR_IOCTL_MAGIC, 0x03, struct pulsar_controls)
 #define PULSAR_IOCTL_SEND_MSG  _IOW(PULSAR_IOCTL_MAGIC, 0x04, struct pulsar_msg)
 
+/*
+ * Host-RAM delay lines = SCOPE's "PC delay atoms" (docs/pc_delay.md, kernel side pulsar_delay.c).
+ * write_slot: capture slot (A - 0xC000) / 2 of the DSP sync output that feeds the delay's input.
+ * tap_slot:   playback slots; the DSP inputs fed by tap k are linked to DM 0xC000 + 2 * tap_slot[k].
+ * Delays are in samples at the current rate (the Sim2k pad value after base.dll's fs/48000 scaling).
+ * Needs a valid PCM route (block size). All delays are freed when the hwdep device is closed.
+ */
+#define PULSAR_DELAY_MAX_TAPS  16
+
+#define PULSAR_DELAY_4K        0      /* "PC Master 4k Delay":  0x1000-word ring, 8 taps, 194..4096     */
+#define PULSAR_DELAY_32K       1      /* "PC Master 32k Delay": 0x8000-word ring, 8 taps, 194..32768    */
+#define PULSAR_DELAY_256K      2      /* "PC 256k Delay": 1 output, 194..0x3fc00 (host copy beyond 2 blocks) */
+#define PULSAR_DELAY_ER        3      /* "PC Early Reflection": 1 output, 16 taps with gains (host computed) */
+
+struct pulsar_delay_alloc {
+	__u32 kind;                               /* PULSAR_DELAY_* */
+	__u32 write_slot;                         /* 0x40..0x17f */
+	__u32 ntaps;                              /* playback slots: 4K/32K 1..8, 256K/ER 1 */
+	__u16 tap_slot[PULSAR_DELAY_MAX_TAPS];    /* in: 0 = kernel picks; out: slots used (0x180..0x1ff) */
+	__s32 delay[PULSAR_DELAY_MAX_TAPS];       /* initial delays (ER: the 16 reflections) */
+	__u32 handle;                             /* out */
+	__u32 reserved[3];
+};
+
+#define PULSAR_DELAY_P_DELAY   0      /* value = samples; clamped as scScope.sys does */
+#define PULSAR_DELAY_P_SOURCE  1      /* value = BAR SRAM dword 0x800..0x1fff written by a DSP async output
+					 (export header 0x63E00000 | dword), polled every block; 0 = host */
+#define PULSAR_DELAY_P_GAIN    2      /* ER: gain of reflection `index`, 1.31 */
+#define PULSAR_DELAY_P_NTAPS   3      /* ER: number of reflections 0..16 */
+
+struct pulsar_delay_param {
+	__u32 handle;
+	__u32 param;                              /* PULSAR_DELAY_P_* */
+	__u32 index;                              /* tap (ER: reflection) */
+	__s32 value;
+};
+
+#define PULSAR_IOCTL_DELAY_ALLOC _IOWR(PULSAR_IOCTL_MAGIC, 0x10, struct pulsar_delay_alloc)
+#define PULSAR_IOCTL_DELAY_FREE  _IOW(PULSAR_IOCTL_MAGIC, 0x11, __u32)
+#define PULSAR_IOCTL_DELAY_PARAM _IOW(PULSAR_IOCTL_MAGIC, 0x12, struct pulsar_delay_param)
+
 #endif /* _PULSAR_UAPI_H_ */

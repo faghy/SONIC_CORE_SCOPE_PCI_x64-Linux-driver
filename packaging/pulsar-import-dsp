@@ -4,12 +4,22 @@
 #
 #   sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe
 #   sudo pulsar-import-dsp /path/to/extracted/app/App/Dsp
+#   sudo pulsar-import-dsp --license /path/to/YOURSERIAL.v5   (your own SCOPE licence key file)
 set -e
 DSP_DIR=/var/lib/snd-pulsar/dsp
 DEV_DIR=/var/lib/snd-pulsar/devices
+PRE_DIR=/var/lib/snd-pulsar/presets
+LIC_DIR=/var/lib/snd-pulsar/license
 SRC="$1"
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo $0 $*"; exit 1; }
-[ -n "$SRC" ] || { sed -n '2,6p' "$0"; exit 1; }
+[ -n "$SRC" ] || { sed -n '2,7p' "$0"; exit 1; }
+if [ "$SRC" = "--license" ]; then
+	[ -f "$2" ] || { echo "no licence key file: $2"; exit 1; }
+	install -d -m 0700 "$LIC_DIR"
+	install -m 0600 "$2" "$LIC_DIR"/
+	echo "licence key file installed into $LIC_DIR (readable by root only)"
+	SRC=""
+fi
 tmp=""
 case "$SRC" in
 *.exe|*.EXE)
@@ -20,15 +30,22 @@ case "$SRC" in
 	SRC="$tmp/app/App/Dsp"
 	;;
 esac
-[ -f "$SRC/puls2os0.21k" ] || { echo "no SCOPE DSP files (puls2os0.21k) in $SRC"; [ -n "$tmp" ] && rm -rf "$tmp"; exit 1; }
-mkdir -p "$DSP_DIR"
-cp -a "$SRC"/. "$DSP_DIR"/
-echo "$(ls "$DSP_DIR" | wc -l) DSP files imported into $DSP_DIR"
-DEVSRC=$(cd "$SRC/../.." 2>/dev/null && pwd)/Devices        # <installer>/app/App/Dsp -> <installer>/app/Devices
-if [ -d "$DEVSRC" ]; then
-	mkdir -p "$DEV_DIR"
-	cp -a "$DEVSRC"/. "$DEV_DIR"/
-	echo "$(find "$DEV_DIR" -name '*.dev' | wc -l) SCOPE devices imported into $DEV_DIR"
+[ -z "$SRC" ] || [ -f "$SRC/puls2os0.21k" ] || { echo "no SCOPE DSP files (puls2os0.21k) in $SRC"; [ -n "$tmp" ] && rm -rf "$tmp"; exit 1; }
+if [ -n "$SRC" ]; then
+	mkdir -p "$DSP_DIR"
+	cp -a "$SRC"/. "$DSP_DIR"/
+	echo "$(ls "$DSP_DIR" | wc -l) DSP files imported into $DSP_DIR"
+	APP=$(cd "$SRC/../.." 2>/dev/null && pwd)            # <installer>/app/App/Dsp -> <installer>/app
+	if [ -d "$APP/Devices" ]; then
+		mkdir -p "$DEV_DIR"
+		cp -a "$APP/Devices"/. "$DEV_DIR"/
+		echo "$(find "$DEV_DIR" -name '*.dev' | wc -l) SCOPE devices imported into $DEV_DIR"
+	fi
+	if [ -d "$APP/Presets" ]; then
+		mkdir -p "$PRE_DIR"
+		cp -a "$APP/Presets"/. "$PRE_DIR"/
+		echo "$(find "$PRE_DIR" -iname '*.pre' | wc -l) presets imported into $PRE_DIR"
+	fi
 fi
 [ -n "$tmp" ] && rm -rf "$tmp"
 rm -rf /var/cache/pulsard

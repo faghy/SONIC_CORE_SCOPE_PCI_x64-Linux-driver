@@ -28,6 +28,9 @@ static int pulsar_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 	struct pulsar_pcm_route route;
 	struct pulsar_controls *ctls;
 	struct pulsar_msg *msg;
+	struct pulsar_delay_alloc dalloc;
+	struct pulsar_delay_param dparam;
+	u32 handle;
 	int err;
 
 	switch (cmd) {
@@ -49,6 +52,21 @@ static int pulsar_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 		err = msg->count > PULSAR_MSG_MAX_WORDS ? -EINVAL : pulsar_dsp_send(chip, msg->words, msg->count);
 		kfree(msg);
 		return err;
+	case PULSAR_IOCTL_DELAY_ALLOC:
+		if (copy_from_user(&dalloc, (void __user *)arg, sizeof(dalloc)))
+			return -EFAULT;
+		err = pulsar_delay_alloc(chip, &dalloc);
+		if (!err && copy_to_user((void __user *)arg, &dalloc, sizeof(dalloc)))
+			err = -EFAULT;
+		return err;
+	case PULSAR_IOCTL_DELAY_FREE:
+		if (get_user(handle, (u32 __user *)arg))
+			return -EFAULT;
+		return pulsar_delay_free(chip, handle);
+	case PULSAR_IOCTL_DELAY_PARAM:
+		if (copy_from_user(&dparam, (void __user *)arg, sizeof(dparam)))
+			return -EFAULT;
+		return pulsar_delay_param(chip, &dparam);
 	case PULSAR_IOCTL_GET_INFO:
 		info.board_raw_id = chip->board_raw_id;
 		info.board_rev = chip->board_rev;
@@ -61,6 +79,13 @@ static int pulsar_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 	default:
 		return -ENOTTY;
 	}
+}
+
+/* the delay lines belong to the process that built the DSP graph (pulsard) */
+static int pulsar_hwdep_release(struct snd_hwdep *hw, struct file *file)
+{
+	pulsar_delay_free_all(hw->private_data);
+	return 0;
 }
 
 static int pulsar_hwdep_mmap(struct snd_hwdep *hw, struct file *file,
@@ -84,6 +109,7 @@ int pulsar_hwdep_create(struct pulsar_card *chip)
 	strscpy(hw->name, "Pulsar2 DSP host port", sizeof(hw->name));
 	hw->private_data = chip;
 	hw->ops.open = pulsar_hwdep_open;
+	hw->ops.release = pulsar_hwdep_release;
 	hw->ops.ioctl = pulsar_hwdep_ioctl;
 	hw->ops.ioctl_compat = pulsar_hwdep_ioctl;
 	hw->ops.mmap = pulsar_hwdep_mmap;

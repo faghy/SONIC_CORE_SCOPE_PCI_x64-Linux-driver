@@ -64,6 +64,7 @@ static irqreturn_t snd_pulsar_interrupt(int irq, void *dev_id)
 
 	if (chip->pcm)
 		pulsar_pcm_interrupt(chip);
+	pulsar_delay_interrupt(chip);
 
 	return IRQ_HANDLED;
 }
@@ -95,6 +96,7 @@ static int __snd_pulsar_probe(struct pci_dev *pci, const struct pci_device_id *p
 	spin_lock_init(&chip->reg_lock);
 	mutex_init(&chip->route_mutex);
 	mutex_init(&chip->fifo_mutex);
+	pulsar_delay_init(chip);
 
 	err = pcim_enable_device(pci);
 	if (err < 0)
@@ -163,8 +165,10 @@ static void snd_pulsar_remove(struct pci_dev *pci)
 {
 	struct snd_card *card = pci_get_drvdata(pci);
 
-	if (card)
+	if (card) {
 		pulsar_pcm_quiesce(card->private_data);
+		pulsar_delay_free_all(card->private_data);
+	}
 }
 
 static struct pci_driver snd_pulsar_driver = {
