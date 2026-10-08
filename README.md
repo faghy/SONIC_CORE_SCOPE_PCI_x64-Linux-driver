@@ -2,6 +2,10 @@
 
 **English** | [Italiano](README.it.md)
 
+![Pulsar Scope: modular rack, cable drag, SCOPE mixer with live meters and on-screen keyboard](docs/media/pulsar-scope-demo.gif)
+
+*Pulsar Scope, the modular GUI. The meter levels and the notes were recorded on a real Pulsar II while the DSP synth was playing.*
+
 A Linux driver for the **Creamware / Sonic Core Pulsar II** DSP sound card (PCI `14b5:0600`, 6× Analog Devices
 SHARC ADSP-21065L). It was written by reverse engineering the Windows SCOPE 5.1 software: the kernel driver
 `scScope.sys` and the `Sim2k.dll` library.
