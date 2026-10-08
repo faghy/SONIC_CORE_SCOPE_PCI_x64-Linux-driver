@@ -202,4 +202,15 @@ sudo rmmod snd-pulsar
    /usr/lib/udev/rules.d, conffile /etc/default/snd-pulsar, /usr/bin/pulsar-scope + pulsarctl, /usr/sbin/pulsar-import-dsp
    (DSP files from the SCOPE installer .exe via innoextract or a folder). Bump packaging/VERSION for every release.
    To update this PC: build the deb, `sudo apt install ./dist/...deb`, then stop wireplumber, rmmod/modprobe snd_pulsar.
-5. **Next:** ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), JACK/Ardour check, .deb package, then the SCOPE-like config app.
+4h. **SCOPE devices + knobs (2026-10-08), deb 0.3.0.** `tools/scope_device.py` (docs/device_format.md): .dev -> plan
+   (modules, internal wires, ports incl. passthrough, consts, params with SCOPE knob/display curves, switches). 95/211
+   complete, 36 usable (no MIDI, no licensed "Effect Package" atoms). pulsard: `devices` (survey, cached
+   /var/cache/pulsard/devices-v1.json, ~60 s first time, served outside the board lock), `load_device`, `set_param`
+   (display units; switch params re-plan + rewire, e.g. Bypass), devices are ONE node (inner modules have parent set,
+   hidden from status), wiring goes through `_src_ep`/`_dst_eps`/`_link`; projects store devices + params.
+   Pad encoding: type&0xF 1 = fix 1.31 (int if max < 0x10000), 2 = IEEE float (min/max float bits), 0xE = MIDI
+   (tools/pulsar_values.py). Frequency pads (unit 1) are scaled by 48000/fs, time pads (unit 2) by fs/48000.
+   GUI: knobs (tools/pulsar_widgets.py, live, Shift = fine, double-click = default), DevicePanel, "SCOPE devices"
+   library branch. Devices folder: /var/lib/snd-pulsar/devices (pulsar-import-dsp copies <installer>/app/Devices).
+5. **Next:** synths (MIDI routing + voice manager), PC-side delay atoms (all delays/reverbs), license unlock word,
+   .pre presets, ADAT/S/PDIF/MIDI, 88.2/96 kHz (PPlate cannot; check other plates), JACK/Ardour check, .deb package, then the SCOPE-like config app.

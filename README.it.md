@@ -23,7 +23,9 @@ Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `
 | App grafica "Pulsar Scope" (Qt): libreria moduli, trascina e rilascia, cavi, cursori degli ingressi | **funziona** (prima versione) |
 | Progetti: salva/apri (`.pulsar`), banco ripristinato da solo dopo un riavvio | **funziona** |
 | Pacchetto `.deb` (driver DKMS, servizio, strumenti, app) | **funziona** |
-| Dispositivi SCOPE (`.dev`), ADAT/S/PDIF/MIDI, verifica JACK/Ardour | da fare |
+| Dispositivi SCOPE (`.dev`): 36 effetti (EQ, filtri, dinamica, distorsione, phaser, flanger, chorus…) come un unico blocco con manopole in unità reali | **funziona** |
+| Manopole in stile SCOPE (Hz, dB…) per dispositivi e moduli comuni, codifica corretta degli ingressi float/interi | **funziona** |
+| Sintetizzatori (MIDI, gestione voci), delay/riverberi (moduli lato PC), dispositivi "Effect Package" con licenza, ADAT/S/PDIF/MIDI | da fare |
 
 ## Architettura
 
@@ -39,6 +41,10 @@ Come su Windows, il driver kernel si limita a esporre l'hardware. L'avvio dei DS
 - **`tools/pulsar_scope.py`**: app modulare "Pulsar Scope" (Qt/PySide6, qualsiasi desktop): si trascinano i moduli
   dalla libreria al banco, si collegano le prese con il mouse, si regolano i valori e si salvano/aprono i progetti
   (`.pulsar`). Si avvia dal menu delle applicazioni. Il banco corrente viene anche salvato da solo e ripristinato all'avvio.
+- **`tools/scope_device.py`**: trasforma un dispositivo SCOPE (`.dev`) in un piano di montaggio: moduli DSP, cavi
+  interni, prese esterne, parametri con unità e curve di SCOPE (`plan`, `survey`, `raw`).
+- **`tools/pulsar_values.py`** / **`tools/pulsar_widgets.py`**: codifica dei valori degli ingressi (fixed 1.31, interi,
+  float) e la manopola in stile SCOPE usata da Pulsar Scope.
 - **`tools/sharc_dis.py`**: disassemblatore SHARC (port di `sharc_dasm.cpp` di MAME, BSD-3).
 - **`docs/`**: note di reverse engineering (mappa registri, protocollo dei comandi, sequenza di boot, clock).
 
@@ -56,8 +62,8 @@ In alternativa puoi indicare la cartella `App/Dsp` con la variabile `PULSAR_DSP_
 
 Scarica `snd-pulsar_<versione>_all.deb` dalla pagina [Releases](https://github.com/faghy/SONIC_CORE_SCOPE_PCI_x64-Linux-driver/releases), poi:
 ```bash
-sudo apt install ./snd-pulsar_0.2.0_all.deb                          # driver (DKMS), servizio, strumenti, Pulsar Scope
-sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe      # una volta: i file DSP di Sonic Core
+sudo apt install ./snd-pulsar_0.3.0_all.deb                          # driver (DKMS), servizio, strumenti, Pulsar Scope
+sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe      # una volta: file DSP e dispositivi di Sonic Core
 ```
 Riavvia (o ricarica il modulo) e la scheda parte da sola. Si rimuove con `sudo apt remove snd-pulsar`
 (`purge` cancella anche i file DSP importati e il banco salvato). Il pacchetto si costruisce con

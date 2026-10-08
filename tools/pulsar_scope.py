@@ -23,7 +23,12 @@ from PySide6.QtGui import (QAction, QBrush, QColor, QDrag, QFont, QKeySequence, 
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QDockWidget, QFileDialog, QFormLayout,
                                QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsView, QHBoxLayout,
                                QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QSlider,
-                               QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+                               QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QGridLayout)
+
+import pulsar_values
+import scope_device
+from pulsar_widgets import Knob
+from PySide6.QtWidgets import QPushButton
 
 SOCKET = os.environ.get("PULSARD_SOCKET", "/run/pulsard.sock")
 LAYOUT_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
@@ -35,6 +40,7 @@ C_BG = QColor(40, 42, 46)
 C_GRID = QColor(48, 50, 55)
 C_PANEL = QColor(62, 64, 70)
 C_PANEL_FIXED = QColor(52, 60, 72)
+C_PANEL_DEV = QColor(78, 66, 50)
 C_TITLE = QColor(28, 30, 33)
 C_TEXT = QColor(220, 220, 220)
 C_DIM = QColor(150, 150, 155)
@@ -75,9 +81,14 @@ def request(req, timeout=30):
 class CatalogThread(QThread):
     done = Signal(object)
 
+    def __init__(self, what="catalog"):
+        super().__init__()
+        self.what = what
+
     def run(self):
         try:
-            self.done.emit(request({"cmd": "catalog"}, timeout=600)["modules"])
+            r = request({"cmd": self.what}, timeout=900)
+            self.done.emit(r["modules"] if self.what == "catalog" else r["devices"])
         except DaemonError as e:
             self.done.emit(e)
 
@@ -158,7 +169,7 @@ class NodeItem(QGraphicsItem):
         p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(0, 0, NODE_W, self.h)
         p.setPen(QPen(C_SEL if self.isSelected() else QColor(20, 20, 22), 1.5))
-        p.setBrush(C_PANEL_FIXED if d.get("fixed") else C_PANEL)
+        p.setBrush(C_PANEL_FIXED if d.get("fixed") else (C_PANEL_DEV if d.get("kind") == "device" else C_PANEL))
         p.drawRoundedRect(r, 5, 5)
         p.setBrush(C_TITLE)
         p.setPen(Qt.NoPen)
@@ -176,13 +187,16 @@ class NodeItem(QGraphicsItem):
         p.setFont(f)
         p.setPen(C_DIM)
         badge = "DSP%d" % d["dsp"] if d.get("dsp") is not None else "PC"
+        if d.get("kind") == "device":
+            badge = "DEV " + badge
         p.drawText(QRectF(NODE_W - 52, 0, 46, TITLE_H), Qt.AlignVCenter | Qt.AlignRight, badge)
         p.setPen(C_TEXT)
         for pad in self.pads_in:
             name = pad.info.get("name") or str(pad.index)
             val = self.win.pad_value(self.id, pad.index)
             if val is not None and not self.is_connected(pad):
-                name += " = %s" % fmt_value(val, pad.info)
+                prm = pulsar_values.param_for(d.get("file"), pad.info)
+                name += " = %s" % prm.fmt(prm.from_raw(val, (self.win.status or {}).get("rate", 48000)))
             p.drawText(QRectF(PAD_R + 4, pad.y() - 8, NODE_W / 2 + 30, 16), Qt.AlignVCenter | Qt.AlignLeft, name)
         for pad in self.pads_out:
             p.drawText(QRectF(NODE_W / 2 - 10, pad.y() - 8, NODE_W / 2 - PAD_R, 16), Qt.AlignVCenter | Qt.AlignRight,
@@ -360,7 +374,11 @@ class RackView(QGraphicsView):
 
     def dropEvent(self, e):
         f = bytes(e.mimeData().data(MIME)).decode()
-        self.win.load_module(f, self.mapToScene(e.position().toPoint()))
+        pos = self.mapToScene(e.position().toPoint())
+        if f.startswith("dev:"):
+            self.win.load_device(f[4:], pos)
+        else:
+            self.win.load_module(f, pos)
         e.acceptProposedAction()
 
 
@@ -374,8 +392,9 @@ class Library(QTreeWidget):
         it = self.currentItem()
         if it is None or it.data(0, Qt.UserRole) is None:
             return
+        m = it.data(0, Qt.UserRole)
         md = QMimeData()
-        md.setData(MIME, it.data(0, Qt.UserRole)["file"].encode())
+        md.setData(MIME, (("dev:" + m["device"]) if "device" in m else m["file"]).encode())
         d = QDrag(self)
         d.setMimeData(md)
         d.exec(Qt.CopyAction)
@@ -410,48 +429,114 @@ def category(m):
 
 # --------------------------------------------------------------------------- value editor
 
-class ValueDialog(QDialog):
-    def __init__(self, parent, node, values):
-        super().__init__(parent)
-        self.setWindowTitle("%s - inputs" % (node.desc.get("title") or node.id))
-        self.node, self.sliders = node, {}
-        lay = QFormLayout(self)
+class DevParam:
+    """Adapter giving a device parameter (scope_device param spec) the Param interface used by Knob."""
+
+    def __init__(self, q):
+        self.q, self.name, self.unit = q, q["name"], q.get("unit") or ""
+        self.spec = dict(q.get("spec") or {}, name=q["name"])
+        self.lo = q["min"] if q.get("min") is not None else 0.0
+        self.hi = q["max"] if q.get("max") is not None else 1.0
+        self.default = q["default"] if q.get("default") is not None else self.lo
+
+    def from_t(self, t):
+        if self.spec.get("knob"):
+            v = scope_device.knob_to_display(self.spec, min(max(t, 0.0), 1.0))
+            if v is not None:
+                return v
+        return self.lo + t * (self.hi - self.lo)
+
+    def to_t(self, v):
+        if self.spec.get("knob"):
+            t = scope_device.display_to_knob(self.spec, v)
+            if t is not None:
+                return t
+        return 0.0 if self.hi == self.lo else (v - self.lo) / (self.hi - self.lo)
+
+    def fmt(self, v):
+        fmt = self.q.get("format")
+        if fmt:
+            try:
+                return scope_device.c_format(fmt, v)
+            except Exception:
+                pass
+        return pulsar_values.Param(self.name, self.unit).fmt(v)
+
+
+class DevicePanel(QDialog):
+    """Front panel of a SCOPE device: one knob per parameter (switches as buttons), applied live."""
+
+    COLS = 6
+
+    def __init__(self, win, node):
+        super().__init__(win)
+        self.win, self.node = win, node
+        self.setWindowTitle(node.desc.get("title") or node.id)
+        lay = QVBoxLayout(self)
+        grid = QGridLayout()
+        lay.addLayout(grid)
+        k = 0
+        for q in node.desc.get("params", []):
+            cur = q.get("value") if q.get("value") is not None else q.get("default")
+            if q.get("discrete") and (q.get("max") or 0) - (q.get("min") or 0) <= 1:
+                b = QPushButton(q["name"])
+                b.setCheckable(True)
+                b.setChecked(bool(cur))
+                b.setMinimumWidth(80)
+                b.toggled.connect(lambda on, name=q["name"]: self.win.set_param_live(self.node.id, name, 1 if on else 0))
+                w = b
+            else:
+                prm = DevParam(q)
+                w = Knob(prm, cur)
+                w.changed.connect(lambda val, name=q["name"]: self.win.set_param_live(self.node.id, name, val))
+            grid.addWidget(w, k // self.COLS, k % self.COLS, Qt.AlignCenter)
+            k += 1
+        if k == 0:
+            lay.addWidget(QLabel("This device has no parameters."))
+        info = QLabel("%s - %d DSP modules on DSP%s, %d cycles" % (
+            node.desc.get("file", ""), node.desc.get("modules", 0), node.desc.get("dsp"), node.desc.get("cycles", 0)))
+        info.setStyleSheet("color: #888")
+        lay.addWidget(info)
+
+
+class KnobPanel(QDialog):
+    """SCOPE-like control panel of a module: one knob per unconnected input, applied live."""
+
+    COLS = 6
+
+    def __init__(self, win, node, values):
+        super().__init__(win)
+        self.win, self.node = win, node
+        self.setWindowTitle(node.desc.get("title") or node.id)
+        rate = (win.status or {}).get("rate", 48000)
+        lay = QVBoxLayout(self)
+        grid = QGridLayout()
+        lay.addLayout(grid)
+        k = 0
         for pad in node.pads_in:
             info = pad.info
+            name = info.get("long") or info.get("name") or str(pad.index)
             if node.is_connected(pad):
-                lay.addRow(info.get("long") or info.get("name") or str(pad.index), QLabel("(connected)"))
-                continue
-            lo, hi = slider_range(info)
-            cur = min(max(s32(values.get(pad.index, lo)), lo), hi)
-            s = QSlider(Qt.Horizontal)
-            s.setRange(0, 1000)
-            s.setValue(int(round(1000.0 * (cur - lo) / (hi - lo))) if hi > lo else 0)
-            lab = QLabel()
-            row = QWidget()
-            h = QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.addWidget(s, 1)
-            h.addWidget(lab)
-            s.valueChanged.connect(lambda v, lab=lab: lab.setText("%5.1f%%" % (v / 10.0)))
-            lab.setText("%5.1f%%" % (s.value() / 10.0))
-            self.sliders[pad.index] = (s, lo, hi, s.value())
-            lay.addRow(info.get("long") or info.get("name") or str(pad.index), row)
-        warn = QLabel("Careful: audio modules can be very loud at full scale.")
+                lab = QLabel("%s\n(connected)" % (info.get("name") or name))
+                lab.setAlignment(Qt.AlignCenter)
+                lab.setStyleSheet("color: #888")
+                w = lab
+            else:
+                param = pulsar_values.param_for(node.desc.get("file"), info)
+                if not param.pad.settable:
+                    continue
+                raw = values.get(pad.index)
+                v = param.from_raw(raw, rate) if raw is not None else param.default
+                w = Knob(param, v)
+                w.changed.connect(lambda val, idx=pad.index, prm=param: self.win.set_value_live(
+                    self.node.id, idx, prm.raw(val, rate)))
+            grid.addWidget(w, k // self.COLS, k % self.COLS, Qt.AlignCenter)
+            k += 1
+        if k == 0:
+            lay.addWidget(QLabel("This module has no settable inputs."))
+        warn = QLabel("Changes are applied immediately. Careful: oscillators are full scale.")
         warn.setStyleSheet("color: #e0a040")
-        lay.addRow(warn)
-        bb = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Close)
-        bb.button(QDialogButtonBox.Apply).clicked.connect(self.apply)
-        bb.rejected.connect(self.reject)
-        lay.addRow(bb)
-
-    def apply(self):
-        """Only the sliders the user moved are sent (untouched inputs keep their state)."""
-        for idx, (s, lo, hi, start) in list(self.sliders.items()):
-            if s.value() == start:
-                continue
-            v = int(round(lo + (hi - lo) * s.value() / 1000.0))
-            self.parent().set_value(self.node.id, idx, v)
-            self.sliders[idx] = (s, lo, hi, s.value())
+        lay.addWidget(warn)
 
 
 # --------------------------------------------------------------------------- main window
@@ -524,6 +609,9 @@ class Window(QMainWindow):
         self.cat_thread = CatalogThread()
         self.cat_thread.done.connect(self.fill_library)
         self.cat_thread.start()
+        self.dev_thread = CatalogThread("devices")
+        self.dev_thread.done.connect(self.fill_devices)
+        self.dev_thread.start()
 
     # ---- daemon calls
     def call(self, req):
@@ -638,14 +726,81 @@ class Window(QMainWindow):
             self.refresh()
 
     def edit_values(self, node):
+        if node.desc.get("kind") == "device":
+            DevicePanel(self, node).show()
+            return
+        if node.desc.get("fixed"):
+            QMessageBox.information(self, "Pulsar Scope", "The levels of the base configuration are in the ALSA "
+                                    "mixer (alsamixer: DSP Out, Input Monitor).")
+            return
         vals = {i: v for (n, i), v in self.values.items() if n == node.id}
-        ValueDialog(self, node, vals).exec()
+        KnobPanel(self, node, vals).show()
+
+    def set_param_live(self, nid, name, value):
+        try:
+            request({"cmd": "set_param", "id": nid, "name": name, "value": value})
+        except DaemonError as e:
+            self.rate_label.setText(str(e))
+            return
+        n = self.nodes.get(nid)
+        if n is not None:
+            for q in n.desc.get("params", []):
+                if q["name"] == name:
+                    q["value"] = value
+        self.mark_dirty()
+
+    def load_device(self, file, pos):
+        r = self.call({"cmd": "load_device", "file": file})
+        if r is not None:
+            self.layout[r["id"]] = (pos.x(), pos.y())
+            self.save_layout_later()
+            self.mark_dirty()
+            self.refresh()
+
+    def set_value_live(self, nid, idx, raw):
+        """Knob moved: send the value without rebuilding the rack."""
+        try:
+            request({"cmd": "set", "id": nid, "in": idx, "value": raw})
+        except DaemonError as e:
+            self.rate_label.setText(str(e))
+            return
+        self.values[(nid, idx)] = raw
+        self.mark_dirty()
+        n = self.nodes.get(nid)
+        if n is not None:
+            n.update()
 
     # ---- library
     def library_double_click(self, it, _col=0):
         m = it.data(0, Qt.UserRole)
-        if m is not None:
-            self.load_module(m["file"], self.view.mapToScene(self.view.viewport().rect().center()))
+        if m is None:
+            return
+        pos = self.view.mapToScene(self.view.viewport().rect().center())
+        if "device" in m:
+            self.load_device(m["device"], pos)
+        else:
+            self.load_module(m["file"], pos)
+
+    def fill_devices(self, devs):
+        if isinstance(devs, Exception) or not devs:
+            return
+        top = QTreeWidgetItem(["SCOPE devices (%d)" % len(devs)])
+        cats = {}
+        for d in sorted(devs, key=lambda d: (d["category"], d["name"].lower())):
+            cat = d["category"] or "Other"
+            if cat not in cats:
+                cats[cat] = QTreeWidgetItem([cat.replace("/", " / ")])
+                top.addChild(cats[cat])
+            it = QTreeWidgetItem([d["name"]])
+            it.setData(0, Qt.UserRole, {"device": d["file"], "long": d["name"], "name": d["name"], "file": d["file"],
+                                        "inputs": [{"name": n} for n in d["inputs"]],
+                                        "outputs": [{"name": n} for n in d["outputs"]], "cycles": d["cycles"],
+                                        "params": d["params"]})
+            it.setToolTip(0, "%s\n%d DSP modules, %d cycles\nparameters: %s" % (
+                d["file"], d["modules"], d["cycles"], ", ".join(d["params"]) or "-"))
+            cats[cat].addChild(it)
+        self.lib.insertTopLevelItem(0, top)
+        top.setExpanded(True)
 
     def fill_library(self, cat):
         if isinstance(cat, Exception):
@@ -677,17 +832,21 @@ class Window(QMainWindow):
 
     def filter_library(self, text):
         t = text.lower()
+
+        def walk(item):
+            m = item.data(0, Qt.UserRole)
+            if m is not None:
+                hide = bool(t) and t not in (m.get("long", "") + " " + m.get("name", "") + " " + m.get("file", "")).lower()
+                item.setHidden(hide)
+                return not hide
+            shown = sum(walk(item.child(j)) for j in range(item.childCount()))
+            item.setHidden(shown == 0)
+            if t:
+                item.setExpanded(shown > 0)
+            return shown > 0
+
         for i in range(self.lib.topLevelItemCount()):
-            top = self.lib.topLevelItem(i)
-            shown = 0
-            for j in range(top.childCount()):
-                it = top.child(j)
-                m = it.data(0, Qt.UserRole)
-                hide = bool(t) and t not in (m["long"] + " " + m["name"] + " " + m["file"]).lower()
-                it.setHidden(hide)
-                shown += not hide
-            top.setHidden(shown == 0)
-            top.setExpanded(bool(t) and shown > 0)
+            walk(self.lib.topLevelItem(i))
 
     def show_module_info(self, it, _prev=None):
         if it is None or it.data(0, Qt.UserRole) is None:
@@ -695,8 +854,9 @@ class Window(QMainWindow):
         m = it.data(0, Qt.UserRole)
         ins = ", ".join(p["name"] for p in m["inputs"]) or "-"
         outs = ", ".join(p["name"] for p in m["outputs"]) or "-"
-        self.lib_info.setText("<b>%s</b><br>%s (%s)<br>in: %s<br>out: %s<br>%d cycles" %
-                              (m["long"], m["name"], m["file"], ins, outs, m["cycles"]))
+        extra = ("<br>parameters: %s" % (", ".join(m["params"]) or "-")) if "device" in m else ""
+        self.lib_info.setText("<b>%s</b><br>%s<br>in: %s<br>out: %s<br>%d cycles%s" %
+                              (m["long"], m["file"], ins, outs, m["cycles"], extra))
 
     # ---- layout persistence
     def load_layout(self):

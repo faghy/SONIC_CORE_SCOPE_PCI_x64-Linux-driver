@@ -1,10 +1,12 @@
 #!/bin/sh
-# Import the Sonic Core DSP files needed by the Pulsar II driver (they are not redistributable).
+# Import the Sonic Core DSP files and SCOPE devices (.dev) needed by the Pulsar II driver
+# (they are not redistributable).
 #
 #   sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe
 #   sudo pulsar-import-dsp /path/to/extracted/app/App/Dsp
 set -e
 DSP_DIR=/var/lib/snd-pulsar/dsp
+DEV_DIR=/var/lib/snd-pulsar/devices
 SRC="$1"
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo $0 $*"; exit 1; }
 [ -n "$SRC" ] || { sed -n '2,6p' "$0"; exit 1; }
@@ -21,9 +23,15 @@ esac
 [ -f "$SRC/puls2os0.21k" ] || { echo "no SCOPE DSP files (puls2os0.21k) in $SRC"; [ -n "$tmp" ] && rm -rf "$tmp"; exit 1; }
 mkdir -p "$DSP_DIR"
 cp -a "$SRC"/. "$DSP_DIR"/
+echo "$(ls "$DSP_DIR" | wc -l) DSP files imported into $DSP_DIR"
+DEVSRC=$(cd "$SRC/../.." 2>/dev/null && pwd)/Devices        # <installer>/app/App/Dsp -> <installer>/app/Devices
+if [ -d "$DEVSRC" ]; then
+	mkdir -p "$DEV_DIR"
+	cp -a "$DEVSRC"/. "$DEV_DIR"/
+	echo "$(find "$DEV_DIR" -name '*.dev' | wc -l) SCOPE devices imported into $DEV_DIR"
+fi
 [ -n "$tmp" ] && rm -rf "$tmp"
 rm -rf /var/cache/pulsard
-echo "$(ls "$DSP_DIR" | wc -l) DSP files imported into $DSP_DIR"
 # start (or restart) the card service if the card is present
 for dev in /dev/snd/hwC*D0; do
 	[ -e "$dev" ] || continue

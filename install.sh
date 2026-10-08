@@ -47,6 +47,12 @@ fi
 mkdir -p "$DSP_DIR"
 cp -a "$DSP_FROM"/. "$DSP_DIR"/
 echo "$(ls "$DSP_DIR" | wc -l) files"
+DEVSRC=$(cd "$DSP_FROM/../.." 2>/dev/null && pwd)/Devices
+if [ -d "$DEVSRC" ]; then
+	mkdir -p /var/lib/snd-pulsar/devices
+	cp -a "$DEVSRC"/. /var/lib/snd-pulsar/devices/
+	echo "$(find /var/lib/snd-pulsar/devices -name '*.dev' | wc -l) SCOPE devices"
+fi
 [ -n "${tmp:-}" ] && rm -rf "$tmp"
 
 step "3/5 kernel module snd-pulsar $VERSION (DKMS)"

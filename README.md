@@ -24,7 +24,9 @@ SHARC ADSP-21065L). It was written by reverse engineering the Windows SCOPE 5.1 
 | "Pulsar Scope" GUI (Qt): module library, drag & drop, cables, input sliders | **working** (first version) |
 | Projects: save/open (`.pulsar`), rack restored automatically after a reboot | **working** |
 | `.deb` package (DKMS driver, service, tools, GUI) | **working** |
-| SCOPE devices (`.dev`), ADAT/S/PDIF/MIDI, JACK/Ardour check | to do |
+| SCOPE devices (`.dev`): 36 effects (EQ, filters, dynamics, distortion, phaser, flanger, chorus…) as one block with knobs in real units | **working** |
+| SCOPE-style knobs (Hz, dB…) for devices and common modules, correct float/integer pad encoding | **working** |
+| Synths (MIDI, voice manager), delays/reverbs (PC-side atoms), licensed "Effect Package" devices, ADAT/S/PDIF/MIDI | to do |
 
 ## Architecture
 
@@ -42,6 +44,10 @@ As on Windows, the kernel driver only exposes the hardware; the DSPs are booted 
 - **`tools/pulsar_scope.py`**: "Pulsar Scope" modular GUI (Qt/PySide6, any desktop): drag modules from the
   library onto the rack, wire pads with the mouse, set input values, save and open projects (`.pulsar`).
   Started from the applications menu. The current rack is also saved automatically and restored at boot.
+- **`tools/scope_device.py`**: turns a SCOPE device (`.dev`) into an assembly plan: DSP modules, internal
+  wires, external ports, parameters with units and SCOPE curves (`plan`, `survey`, `raw`).
+- **`tools/pulsar_values.py`** / **`tools/pulsar_widgets.py`**: pad value encoding (fixed 1.31, integer, float) and
+  the SCOPE-style knob used by Pulsar Scope.
 - **`tools/sharc_dis.py`**: SHARC disassembler (port of MAME's `sharc_dasm.cpp`, BSD-3).
 - **`docs/`**: reverse-engineering notes (register map, command protocol, boot sequence, clock, streaming).
 
@@ -59,8 +65,8 @@ Alternatively, point the `PULSAR_DSP_DIR` variable to its `App/Dsp` folder.
 
 Download `snd-pulsar_<version>_all.deb` from the [Releases](https://github.com/faghy/SONIC_CORE_SCOPE_PCI_x64-Linux-driver/releases) page, then:
 ```bash
-sudo apt install ./snd-pulsar_0.2.0_all.deb                          # driver (DKMS), service, tools, Pulsar Scope
-sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe      # once: the Sonic Core DSP files
+sudo apt install ./snd-pulsar_0.3.0_all.deb                          # driver (DKMS), service, tools, Pulsar Scope
+sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe      # once: Sonic Core DSP files and devices
 ```
 Reboot (or reload the module): the card starts by itself. Remove with `sudo apt remove snd-pulsar`
 (`purge` also deletes the imported DSP files and the saved rack). Build the package yourself with
