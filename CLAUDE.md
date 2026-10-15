@@ -121,7 +121,7 @@ card 2: Pulsar2 [SonicCore Pulsar2], device 0: Pulsar PCM [Pulsar2 DSP Audio]
 
 ### Directory:
 ```bash
-cd /home/faghy/puksar2/linux-driver
+cd linux-driver   # this repository
 ```
 
 ### Build command:

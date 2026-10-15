@@ -18,7 +18,7 @@
 #include "pulsar_uapi.h"
 
 #define DRV_NAME "snd-pulsar"
-#define DRV_DESC "Creamware / Sonic Core Scope & Pulsar II ALSA Driver"
+#define DRV_DESC "ALSA driver for the Creamware / Sonic Core Pulsar II"
 
 /* PCI Vendor and Device IDs (from scopewdm64.inf) */
 #define PCI_VENDOR_ID_CREAMWARE        0x14b5

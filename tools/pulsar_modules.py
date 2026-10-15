@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 pulsar_modules.py - link, load, activate and wire relocatable DSP modules (.dsp/.ol) on a running
 Pulsar2 (pluto / ADSP-21065L) DSP, replicating SCOPE's Sim2k.dll. Spec: docs/module_loading.md.

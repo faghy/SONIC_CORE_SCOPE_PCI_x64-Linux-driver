@@ -15,7 +15,7 @@
 
 #include "pulsar.h"
 
-MODULE_AUTHOR("Sonic Core / Creamware Linux Open-Source Project");
+MODULE_AUTHOR("Faghy <christian.serafino@dueclic.com>");
 MODULE_DESCRIPTION(DRV_DESC);
 MODULE_LICENSE("GPL");
 

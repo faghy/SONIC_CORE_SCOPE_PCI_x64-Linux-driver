@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Install the Creamware / Sonic Core Pulsar II driver: kernel module (DKMS), boot service, tools, DSP files.
 #
 #   sudo ./install.sh [--dsp-from PATH]

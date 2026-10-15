@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 pulsar_values - how a DSP pad value is encoded, and how a user-facing value (with unit and curve) maps to it.
 

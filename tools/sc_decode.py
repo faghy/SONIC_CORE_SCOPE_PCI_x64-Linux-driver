@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 sc_decode.py - decode Creamware / Sonic Core "SC" (and "XG") DSP object files.
 

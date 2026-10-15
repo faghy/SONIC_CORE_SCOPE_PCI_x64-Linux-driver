@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Boot the Pulsar II and keep running as the DSP daemon (pulsard), started by snd-pulsar@.service as root.
 # pulsard restores the saved mixer levels and the last rack itself once the card is up.
 set -e

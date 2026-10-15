@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 pulsar_midi.py - MIDI for the Pulsar II on Linux: an ALSA sequencer client ("Pulsar2 MIDI") that feeds MIDI
 from any ALSA/PipeWire application (Ardour, a keyboard, aseqdump ...) into the DSP modules' MIDI pads, plus

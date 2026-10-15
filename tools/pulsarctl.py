@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """pulsarctl - send one command to pulsard and print the JSON reply.
 
   pulsarctl.py status

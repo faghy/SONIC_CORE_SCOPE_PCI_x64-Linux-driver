@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 pulsar_loader.py - userspace DSP bring-up for the Creamware / Sonic Core Pulsar II.
 

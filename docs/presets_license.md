@@ -130,95 +130,25 @@ root PresetCategory (PresetCategory::Read2 @100aac10)
 5. Nothing goes to a server. **[C]** (no network code on this path; `GetTransferString` only builds the text
    that the user would send to Sonic Core when *requesting* a key.)
 
-### L.1 Key file (`CPCheck`, base.dll) [C, V]
-`CPCheck::RegistryPath` @10010300: `ExePath + "keyfile.v5"` unless `[KEYS] REGISTRY PATH` is set in the ini.
-`ReadEntry` @100500d0 skips CR/LF, then reads **fixed 0x73-byte records** that start with `+`.
+### L.1 Key file
+The owner's key file (`*.v5`, SCOPE's "product registry") lists the products licensed for one board. Each
+record holds the board serial, the product it unlocks (manufacturer, family, product, level) and a key.
+`tools/pulsar_license.py` reads and checks it the way SCOPE does, so that it can pick the record that matches a
+module and make sure the record belongs to the installed board. The record layout and its encoding are
+deliberately not documented here: they are not needed to use the driver.
 
-| offset | length | content |
-|---|---|---|
-| 0x00 | 1 | `+` |
-| 0x02 | 9 | board serial string (§L.2) |
-| 0x0C | 0x29 | product name, space padded (display only) |
-| 0x35 | 14 | date `mm/dd/yy hh:mm` (display only) |
-| 0x44 | 1 | `0` = permanent, `1` = temporary (time credit kept in the board EEPROM) |
-| 0x45 | 12 | key string |
-| 0x51 | 2 | record checksum, hex |
-| 0x53 | 32 | encrypted fields: 32 hex digits = 8 fields of 4 hex digits |
+### L.2 Board serial
+The serial in the key file matches the number that the board's uC reports for **uC command 0x229**
+(`pulsar_loader` `uc_query`, clock_rate.md §1.1). This was checked on the owner's card **[V]**. Records for
+other boards are ignored, so a key file only works on the board it was issued for.
 
-Decryption (`DecryptFromRegistry` @10010220): k = `rec[0x4B] + rec[0x48]` (mod 13 if > 12); character i is
-looked up in a 35-character table and the digit is `index − i mod 6 − k` (must be 0..15). The inverse,
-`CryptForRegistry` @10010180, is not implemented in our tools.
+### L.3 From seg_id to the two words
+For each module that needs an unlock, the driver looks for the record whose product matches the module's
+`seg_id` and derives two 32-bit words: the *module id* (from `seg_id`) and the *key word* (from the record's
+key). If there is no matching record the module is not loaded, like SCOPE's "Unregistered device detected".
 
-Checksum (`ReadEntry`): the 0x73 bytes with the checksum field blanked and the encrypted part replaced by its
-plain hex digits are summed as signed chars and printed with `"%lX"`; this repeats on the printed text while the
-sum is above 0xFF. The result must equal the 2 stored characters; otherwise "Found corrupted data in the product
-registry!".
-
-Fields f0..f7 (`GetRegistryEntry` @1006cf00, `ValidateKey` @100625c0):
-
-| field | meaning | used as |
-|---|---|---|
-| f0 | manufacturer | must equal seg_id word 0 |
-| f1 | record type | 1 or 2 seen; selects the f7 rule below |
-| f2 | family | must equal seg_id word 1 |
-| f3 | component | range check only |
-| f4 | product | must equal seg_id word 2 |
-| f5 | version | range check only |
-| f6 | level | must equal seg_id word 4 |
-| f7 | hardware word | compared with the board's uC info word (below) |
-
-The owner's file: 27 records, all checksums and decryptions valid, f1 = 2, f6 = 2, f7 = 0xFFFF **[V]**.
-
-### L.2 Board serial [C, V]
-`CPCheck::String2SnoLong` @1004ffb0: the 9-character serial holds 8 base-26 digits (26-character alphabet,
-fixed position permutation) plus a check character (`FUN_10011520` @10011520). The value goes through
-`FUN_10011350` @10011350 and `(x · 0x120DF) mod 0x1E521609`.
-
-The result is the number the board's uC reports for **uC command 0x229** (`pulsar_loader` `uc_query`,
-clock_rate.md §1.1). This was checked on the owner's card: the serial in the key file maps exactly to the
-serial the card returns **[V]**. `CPCheck::GetSno` @10037080 reads it from Sim2k `HardwareInfo` word 0x16 per
-board (board vt+0xf8).
-
-`CPCheck::GetBoardType` @10037140 decodes the board family from the serial ("Pulsar2" for the owner's card).
-
-The second per-board value, `HardwareInfo` word 0x19 (board vt+0xfc = `(reply of uC command 0x21F >> 16) &
-0xFFFF`), is the "uC info word" checked against f7:
-
-- f1 = 1: the info word must be 0xFFFF.
-- f1 > 1 and a permanent record: f7 must equal the info word.
-
-`pulsar_loader.finish_run` now keeps both values (`Board.uc_serial`, `Board.uc_info`).
-
-### L.3 From seg_id to the two words [C]
-Who asks: Sim2k `FUN_10c1bea0` (module upload) reads `seg_id` after uploading `seg_mod` and calls
-`FUN_10c031f0` → base.dll `GPCallBack(1, name, w0..w5, &sno)` @100c0f90 → `CPCheck::RequestModuleKey`
-@100c0b80 → `GetRegistryEntry`. The answer is the key word (return value) and the serial of the board the
-key belongs to. If there is no key, Sim2k unloads the module with "Unregistered device detected".
-
-`GetRegistryEntry` does the following:
-
-1. It collects the serials of all installed boards (`GetSno`).
-2. It looks for a valid record whose fields match the seg_id (f0, f2, f4, f6).
-3. It checks that the record's serial is one of the installed boards and applies the f1/f7 rule.
-4. It calls `ValidateKey(w0, w1, w2, f3, w4, f5, sno, key string, 0)`.
-
-`ValidateKey` @100625c0:
-
-- The key string must have 12 characters.
-- `ValidateRange` @10010120 checks the ids.
-- The serial must not be `000000000`, unless the ini switch `EnableHwTest` is set.
-- `module id = GetModuleID(w0, w1, w2)` @100108c0:
-  `x = ((w0<<8 ^ w1)<<8 ^ w2)<<8 ^ (w0>>8)`, `id = (x · 0x47882121) mod 0x79E9941B − 0x73002CF3`
-  (signed 32/64-bit arithmetic; Sim2k `FUN_10c45e60` computes the same).
-- The key string is normalized (`FUN_10011310`: upper case, O→0, I→1).
-- `FUN_10037820` @10037820 decodes 8 base-26 digits (another position permutation, own check character).
-  It then compares 2 more characters with a re-encoding that depends on the module id and the serial
-  (`FUN_100115a0`).
-- Key word = `FUN_1000fca0`(decoded value) @1000fca0: a fixed list of 15 add/xor/rotate steps
-  (`DAT_10137160`).
-
-**Not reimplemented:** the `FUN_100115a0` comparison. It is the key generator itself, so it is deliberately left
-out. The uC performs the real check (§L.4), and the optional hardware check of §L.5 replaces it.
+**Not implemented, on purpose:** anything that creates or changes keys. The driver only uses the owner's
+existing key file; the real check and the unlock word are computed by the board's micro-controller (§L.4).
 
 ### L.4 Unlock on the board [C]
 Board vt+0x184 = `FUN_10c2f2c0` @10c2f2c0 on Pulsar2 (vtable 0x10c87d74). It is called as

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 Pulsar Scope - modular patching GUI for the Creamware / Sonic Core Pulsar II (Qt / PySide6).
 

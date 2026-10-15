@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 pulsar_delay.py - SCOPE's "PC delay atoms" on Linux (docs/pc_delay.md).
 

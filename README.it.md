@@ -9,6 +9,12 @@
 Driver Linux per le schede audio DSP **Creamware / Sonic Core Pulsar II** (PCI `14b5:0600`, 6× SHARC ADSP-21065L).
 È sviluppato tramite reverse engineering del software Windows SCOPE 5.1: il driver kernel `scScope.sys` e la libreria `Sim2k.dll`.
 
+Sito del progetto: **https://pulsar.faghy.it/it**
+
+> È un progetto indipendente, **non affiliato, approvato o supportato da Sonic Core** né da Creamware.
+> "Creamware", "Sonic Core", "Pulsar" e "SCOPE" sono marchi dei rispettivi proprietari e sono citati solo
+> per indicare l'hardware a cui è destinato il driver.
+
 ## Stato
 
 | Funzione | Stato |
@@ -72,7 +78,7 @@ In alternativa puoi indicare la cartella `App/Dsp` con la variabile `PULSAR_DSP_
 
 Scarica `snd-pulsar_<versione>_all.deb` dalla pagina [Releases](https://github.com/faghy/SONIC_CORE_SCOPE_PCI_x64-Linux-driver/releases), poi:
 ```bash
-sudo apt install ./snd-pulsar_0.6.0_all.deb                          # driver (DKMS), servizio, strumenti, Pulsar Scope
+sudo apt install ./snd-pulsar_0.6.1_all.deb                          # driver (DKMS), servizio, strumenti, Pulsar Scope
 sudo pulsar-import-dsp SONIC_CORE_SCOPE_PCI_v5.1.2709-x64_EN.exe      # una volta: file DSP e dispositivi di Sonic Core
 ```
 Riavvia (o ricarica il modulo) e la scheda parte da sola. Si rimuove con `sudo apt remove snd-pulsar`
@@ -126,4 +132,6 @@ Altri comandi di `pulsar_test.sh` (tutti richiedono root):
 
 ## Licenza
 
-GPL-2.0-or-later (driver kernel). `tools/sharc_dis.py` deriva da MAME (BSD-3-Clause).
+GPL-2.0-or-later (vedi [LICENSE](LICENSE)): driver kernel, strumenti e pacchetto. `tools/sharc_dis.py`
+deriva da MAME e resta BSD-3-Clause. I file DSP, i device e i preset di Sonic Core non fanno parte del progetto
+e restano sotto la loro licenza.

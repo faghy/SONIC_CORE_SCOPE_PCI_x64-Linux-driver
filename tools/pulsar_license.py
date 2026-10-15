@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 pulsar_license.py - use the owner's SCOPE licence key file (*.v5) to unlock licensed DSP modules
 ("Effect Package I/II" and every other module that has a seg_id section and a magicProt word).

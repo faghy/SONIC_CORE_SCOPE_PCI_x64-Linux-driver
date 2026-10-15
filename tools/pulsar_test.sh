@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # First hardware test: load snd-pulsar, show card info, boot the DSPs.
 # Run as root (e.g. via pkexec).
 set -u

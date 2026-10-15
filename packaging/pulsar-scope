@@ -1,2 +1,3 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 exec python3 /usr/lib/snd-pulsar/tools/pulsar_scope.py "$@"

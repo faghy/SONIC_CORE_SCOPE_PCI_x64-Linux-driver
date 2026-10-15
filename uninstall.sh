@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Remove everything install.sh put in place (DSP files and /etc/default/snd-pulsar are kept unless --purge).
 set -uo pipefail
 [ "$(id -u)" = 0 ] || { echo "run as root (sudo or pkexec)"; exit 1; }

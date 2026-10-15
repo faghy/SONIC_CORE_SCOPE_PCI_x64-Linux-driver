@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Build snd-pulsar_<version>_all.deb from this repository (no root needed).
 #   packaging/build-deb.sh [OUTDIR]
 set -euo pipefail
@@ -31,6 +32,7 @@ install -D -m 0644 "$REPO/packaging/pulsar-scope.desktop" "$ROOT/usr/share/appli
 install -D -m 0644 "$REPO/packaging/snd-pulsar.default" "$ROOT/etc/default/snd-pulsar"
 install -D -m 0644 "$REPO/README.md" "$ROOT/usr/share/doc/snd-pulsar/README.md"
 install -m 0644 "$REPO/README.it.md" "$ROOT/usr/share/doc/snd-pulsar/README.it.md"
+install -m 0644 "$REPO/packaging/deb/copyright" "$ROOT/usr/share/doc/snd-pulsar/copyright"
 cp -r "$REPO/docs" "$ROOT/usr/share/doc/snd-pulsar/docs"
 find "$ROOT/usr/lib/snd-pulsar" -name __pycache__ -prune -exec rm -rf {} +
 

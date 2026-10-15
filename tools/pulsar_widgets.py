@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 pulsar_widgets - SCOPE-style controls for Pulsar Scope (Qt / PySide6).
 

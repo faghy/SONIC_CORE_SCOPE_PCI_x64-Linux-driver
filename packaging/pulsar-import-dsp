@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Import the Sonic Core DSP files and SCOPE devices (.dev) needed by the Pulsar II driver
 # (they are not redistributable).
 #

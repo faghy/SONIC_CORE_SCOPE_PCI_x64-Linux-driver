@@ -1,7 +1,7 @@
 # Contributing
 
 Thank you for your interest in the Linux driver for the Creamware / Sonic Core Pulsar II.
-This project is a clean-room reimplementation built by reverse engineering, so a few rules are stricter
+This project is an independent reimplementation built by reverse engineering, so a few rules are stricter
 than usual. Please read them before opening a pull request.
 
 (Italian speakers: issues and pull requests in Italian are welcome too.)
